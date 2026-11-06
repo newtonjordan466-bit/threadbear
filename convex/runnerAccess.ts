@@ -164,6 +164,7 @@ export const ACCESS: Record<string, Access> = {
   // no runner on a runner key needs it, and it can shadow other ids.
   setSchedules: 'owner',
   schedules: 'own',
+  schedulesSince: 'own',
   saveSchedule: 'own',
   deleteSchedule: 'own',
   adoptSchedules: 'own',
@@ -202,6 +203,7 @@ export const ACCESS: Record<string, Access> = {
   listRunnerKeys: 'owner',
   revokeRunnerKey: 'owner',
   audit: 'owner',
+  scrubStoredBatch: 'owner',
   auditRemove: 'owner',
   purgeRunner: 'owner',
   // relay.ts (API 44): other runners' threads read and steered from the main

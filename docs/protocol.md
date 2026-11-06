@@ -1235,7 +1235,15 @@ everything under it used under 2 seconds of CPU between two looks. The
 shells are found under the thread's CLI (the process whose arguments
 carry `--resume=<session>` or `--session-id=<session>`) and matched to
 their jobs by the output file on their stdout. Monitors are left alone;
-they sit quiet by design. Codex's background terminals leave no files,
+they sit quiet by design. So is a shell running a command that waits on
+Mike: a `browserbear handoff … --wait` (or `--until-url`,
+`--until-text`) process under it, read from ps's full command lines the
+way browserbear reads its flags. A shell whose own text only mentions
+one doesn't count. It's left alone until its own `--timeout` (20 minutes
+when not given) plus 5 minutes has passed since that process started
+(ps's etime), and judged as usual after that, as it should have exited
+by itself by then. The first wait the check sees sets that deadline for
+the job, so a loop that keeps starting new handoffs can't put it off. Codex's background terminals leave no files,
 so Codex threads aren't looked at.
 
 The thread gets one message from the runner (origin `runner`) listing
@@ -3360,6 +3368,11 @@ kept in `schedules.json` in the data dir.
   it moves its own `schedules.json` up, under its `runnerId`, and from
   then on the file is only the copy. With sync off, or an older backend,
   schedules stay the runner's own file as before.
+  From backend API 45 a runner reads the table once with
+  `sync:schedulesSince` and then only the rows written since, plus the ids
+  gone (`scheduleGone`, kept a day), asking again from 5 seconds before the
+  newest row it heard. A claim doesn't count as a write for this. An older
+  runner goes on using `sync:schedules`.
 - **Agents** make and change schedules with the `threadbear` tools
   (`schedule_message`, `list_schedules`, `update_schedule`,
   `delete_schedule`); `createdBy` is their thread. By default an agent's
@@ -3630,6 +3643,13 @@ the mirror back as state. The Mac app doesn't use it.
   also `models?` (each `id, title, effortLevels?, defaultEffort?`) and
   `defaultEffort?`, for the phone's new thread pickers). The same at start,
   and the accounts again once a heartbeat first says the backend is at 20.
+  From backend API 48 each project also has a small row in `projectHeads`
+  (no goals, state, notes or folders), written only when what it holds
+  changes apart from `updatedAt`, which `phone:projects` reads. Every project
+  from before is copied there on the first heartbeat any runner sends, once
+  (`backendMarks`); until then `phone:projects` reads `projects`.
+  `sync:sharedUsage` takes the caller's `runnerId` and doesn't read that
+  runner's rows, so it doesn't re-run for the runner's own writes.
 - **Project pictures** (backend API 5). A project's picture goes to the
   deployment's file storage so the phone can show it: the runner asks
   `sync:projectIcons` once for what the mirror has, and for each project
@@ -3714,10 +3734,36 @@ the mirror back as state. The Mac app doesn't use it.
   a newer state for the same thread replaces the one waiting. Rows are
   current state, so a long outage costs one write per changed thread
   when it's back.
+- **Secrets.** Every mutation goes through the runner's scrubber on its way up
+  (`ConvexSync.post`, `src/scrub.ts`), every free-text field at any depth, so a
+  new field is covered without anyone remembering to: known values first
+  (`src/secret-values.ts`), then the shape rules (`src/redaction.ts`). Identity
+  fields aren't touched (`NOT_TEXT` there: ids, `key`, timestamps), the digests
+  that decide what's changed are of the row before scrubbing, so a rule changing
+  writes nothing by itself, and the runner's own copy never changes. A message
+  or tool line is also scrubbed before it's cut short. A string whose check throws
+  goes up as `HELD_BACK`, and `sync.scrub.failed` counts them. While the runner
+  is still reading `.env` files, mutations other than the heartbeat wait, for up
+  to a minute, then fail so the flush tries again; a folder that doesn't answer
+  in 5 seconds is left for the next look and counted in `foldersUnread`. Backend API 47
+  does the shape check again in every mutation that takes a runner's text, and
+  on a command's `note` and a call's `result` (scrubbed as parsed JSON, so it stays
+  JSON). A command's `args` are stored word for word only so they reach the runner
+  intact, and are dropped when it's over, however it ended, keeping only `images`
+  (`relay:queueCommand` skips the runner's scrubbing for the same reason). A
+  question's `answers` may name it as
+  scrubbed (`matchAnswers`). A schedule that lives in the backend comes back
+  scrubbed, so one whose text holds a secret runs with `[REDACTED]`. Pictures
+  aren't scrubbed. `src/withhold.ts` says which tool calls' output must never
+  upload; no tool output goes up today, so nothing calls it on the way up yet.
 - **Status.** `runner.status` has `sync: { state: "off" | "ok" | "error",
   reason?, url?, runnerId?, name?, threads?, messages?, lastSyncAt?,
   lastError?, pending?, retryAt?, commands?: { state: "off" | "on" |
-  "error", applied, failed, lastError? } }` (`reason` says why it's off;
+  "error", applied, failed, lastError? }, scrub?: { rulesVersion, knownValues,
+  foldersUnread?, changed, failed, lastFailure?, backendChecks? } }`, and `secretCheck: { state:
+  "off" | "unsupported" | "unavailable" | "on", reason?, since, checkedText,
+  checkedImages, flaggedText, flaggedImages, errors, rulesAndModel, rulesOnly,
+  lastRunAt?, skippedOnBattery?, file? }` (`reason` says why it's off;
   `threads` and `messages` are rows written since start; `pending`
   changes waiting), and `tb status` prints it as one line.
 - **Convex side.** `convex/` at the repo root (schema, `sync.ts` for the
@@ -4053,6 +4099,7 @@ anyone's); "any runner" is any good key. Anything not sorted is owner only.
 | `adoptPools` | owner only | as `savePools`; a runner key's runner keeps its own until the main Mac sets them |
 | `setSchedules` | owner only | mirrored rows, for a runner on a pre-API 9 schedules.json: no runner key's runner needs it, and it could shadow another runner's ids (its runner stops mirroring, quietly) |
 | `schedules` | its own | lists only its runner's schedules; the owner sees all |
+| `schedulesSince` | its own | as `schedules`, and hears of only its own runner's rows and ids gone |
 | `saveSchedule` | its own | the schedule's `runnerId`, and every row with that id, mirrored ones too: no schedule on another runner; a runner key's ids are UUIDs |
 | `deleteSchedule` | its own | the schedule's runner |
 | `adoptSchedules` | its own | `runnerId`: replaces only its own old mirrored rows; for a runner key all or nothing (UUID ids no other runner has, within its caps), saying which it held back |
@@ -4082,6 +4129,7 @@ anyone's); "any runner" is any good key. Anything not sorted is owner only.
 | `listRunnerKeys` | owner only | |
 | `revokeRunnerKey` | owner only | |
 | `audit` | owner only | what the old shared key could have left (`tb runner audit`) |
+| `scrubStoredBatch` | owner only | today's secret rules over stored rows, a page at a time (`runner/scripts/scrub-stored.mjs`) |
 | `auditRemove` | owner only | takes out the exact rows `tb runner audit --drop` picks, each only if it's still the version listed |
 | `purgeRunner` | owner only | `tb runner revoke <runnerId> --purge`: everything a runner with no live key wrote, a batch a call |
 | `remoteTail` | owner only | another runner's messages (`convex/relay.ts`, Other runners' threads through the backend) |

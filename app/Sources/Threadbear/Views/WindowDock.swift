@@ -273,6 +273,8 @@ struct RootView: View {
         }
         // Saves where the window is, so the next launch opens it there.
         .background(MainWindowFrameTracker())
+        // The desktop, frosted, while glass is on (Glass).
+        .background(GlassBackground())
     }
 
     /// Once the page or panel is drawn, for the card to point at.
@@ -308,6 +310,15 @@ struct RootView: View {
         // A scripted run's panel windows stay behind Mike's, as its main one does.
         o.prepareWindow = { if Automation.instanceId != nil { $0.tuckBehind() } }
         #endif
+        // Glass: the sidebar shows the frosted window as it is, and the
+        // thread and the panels beside it sit on a darker card, as in
+        // MonoCode. Reading Glass here re-renders the dock when it changes.
+        let glass = Glass.shared
+        if glass.enabled {
+            let card = Glass.cardColor.opacity(glass.cardTint)
+            o.dividers = Glass.wash
+            o.panelFill = { $0 == WindowDock.threads ? .clear : card }
+        }
         return o
     }
 

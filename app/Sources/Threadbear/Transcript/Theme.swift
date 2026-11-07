@@ -83,14 +83,26 @@ enum TypeScale {
         return percent == 100 ? size : (size * CGFloat(percent) / 100).rounded()
     }
 
+    /// MonoCode's text sizes (Glass.compactType, on by default) or
+    /// Threadbear's own, then scaled. MonoCode 0.16 sets replies at 14 on 24,
+    /// titles at 13, headings at 12 and times and pills at 11.
+    static var compact: Bool {
+        if Thread.isMainThread { return MainActor.assumeIsolated { Glass.shared.compactType } }
+        return Glass.compactTypeNow.load(ordering: .relaxed)
+    }
+
+    static func pick(_ threadbear: CGFloat, mono: CGFloat) -> CGFloat {
+        scaled(compact ? mono : threadbear)
+    }
+
     // Transcript
-    static var body: CGFloat { scaled(15) }
+    static var body: CGFloat { pick(15, mono: 14) }
     /// Fixed line heights, with the glyphs centred in them (see
     /// `Theme.lines`): about 1.5 times the text size, like the apps Mike
     /// compares this with.
-    static var bodyLine: CGFloat { scaled(23) }
+    static var bodyLine: CGFloat { pick(23, mono: 24) }
     /// Work lines: group summaries, tool and thinking rows, the working line.
-    static var work: CGFloat { scaled(14) }
+    static var work: CGFloat { pick(14, mono: 13.5) }
     static var workLine: CGFloat { scaled(20) }
     /// One monospaced size and leading for code blocks, tool output and
     /// diffs: at 12.5 and 13 a file read in a tool and the code block under
@@ -102,10 +114,10 @@ enum TypeScale {
     static var outputLine: CGFloat { codeLine }
     static var diff: CGFloat { code }
     static var diffLine: CGFloat { codeLine }
-    static var headings: (CGFloat, CGFloat, CGFloat) { (scaled(18), scaled(16), scaled(15)) }
-    static var cardTitle: CGFloat { scaled(14) }
+    static var headings: (CGFloat, CGFloat, CGFloat) { (pick(18, mono: 17), pick(16, mono: 15), pick(15, mono: 14)) }
+    static var cardTitle: CGFloat { pick(14, mono: 13) }
     /// Card labels, notes and table headers.
-    static var label: CGFloat { scaled(13) }
+    static var label: CGFloat { pick(13, mono: 12) }
     /// Folders after file names, "Show 12 more lines", line counts. Whole
     /// points throughout, see `scaled`.
     static var detail: CGFloat { scaled(12) }
@@ -113,22 +125,22 @@ enum TypeScale {
     static var small: CGFloat { scaled(11) }
 
     // Sidebar
-    static var sidebarTitle: CGFloat { scaled(14) }
-    static var sidebarPreview: CGFloat { scaled(13) }
+    static var sidebarTitle: CGFloat { pick(14, mono: 13.5) }
+    static var sidebarPreview: CGFloat { pick(13, mono: 12) }
     /// Times, statuses and account names on a row.
     static var sidebarMeta: CGFloat { scaled(11) }
     /// "Needs you", "Running", "Inbox": semibold at the previews' size, so a
     /// heading isn't weaker than the rows it groups.
-    static var sidebarHeading: CGFloat { scaled(13) }
-    static var sidebarButton: CGFloat { scaled(14) }
-    static var sidebarFooter: CGFloat { scaled(13) }
+    static var sidebarHeading: CGFloat { pick(13, mono: 12) }
+    static var sidebarButton: CGFloat { pick(14, mono: 13) }
+    static var sidebarFooter: CGFloat { pick(13, mono: 12) }
 
     // Header and composer
     /// At 14 the title was smaller than the 15 pt text under it; Codex and
     /// Claude set theirs at about 15.
-    static var header: CGFloat { scaled(15) }
-    static var composer: CGFloat { scaled(15) }
-    static var chip: CGFloat { scaled(13) }
+    static var header: CGFloat { pick(15, mono: 13) }
+    static var composer: CGFloat { pick(15, mono: 14) }
+    static var chip: CGFloat { pick(13, mono: 12) }
 }
 
 /// A layout size (a padding, spacing, icon, frame or corner radius) at the

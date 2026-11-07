@@ -74,6 +74,14 @@ public struct DockOptions {
     public var windowContent: @MainActor (AnyView) -> AnyView = { $0 }
     /// Called on a panel's window of its own as it's made, before it shows.
     public var prepareWindow: @MainActor (NSWindow) -> Void = { _ in }
+    /// What's under the whole dock, and so shows through the 1 pt gaps
+    /// between panels as their dividers. Nil: the window's colour, with
+    /// the system separator in the gaps.
+    public var dividers: Color?
+    /// Each panel's fill in the window, by the panel on show in its group.
+    /// Nil: the window's colour. An app with a see-through window gives
+    /// panels a tint here, or `.clear` to let it all show.
+    public var panelFill: (@MainActor (PanelID) -> Color)?
 
     public init() {}
 }
@@ -121,8 +129,8 @@ public struct DockView: View {
     public var body: some View {
         NodeView(node: controller.layout.root)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(DockTheme.hairline)
-            .background(DockTheme.panel)
+            .background(options.dividers ?? DockTheme.hairline)
+            .background(options.dividers == nil ? DockTheme.panel : .clear)
             .overlay(alignment: .topLeading) {
                 DragOverlay()
                     .allowsHitTesting(false)
@@ -389,7 +397,7 @@ struct GroupView: View {
                 .opacity(lifted ? 0.18 : 1)
                 .scaleEffect(lifted ? 0.985 : 1)
         }
-        .background(DockTheme.panel)
+        .background(options.panelFill?(group.selected) ?? DockTheme.panel)
         .overlay(alignment: .top) {
             if !header && !corner {
                 HiddenTitleStrip(panel: group.selected)

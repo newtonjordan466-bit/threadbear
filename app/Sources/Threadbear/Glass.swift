@@ -4,7 +4,8 @@ import SwiftUI
 import Synchronization
 
 /// The MonoCode look (Jordan, 6 Nov): the window as frosted glass over the
-/// desktop, and MonoCode 0.16's text sizes. Both are this Mac's own
+/// desktop, and MonoCode 0.16's style (its text sizes, flat grey pills
+/// under the message box and grey message bubbles). Both are this Mac's own
 /// settings (Settings > General > Appearance), kept in UserDefaults like
 /// the zoom, and both start on.
 ///
@@ -20,10 +21,10 @@ final class Glass {
 
     nonisolated static let enabledKey = "glassEnabled"
     nonisolated static let strengthKey = "glassStrength"
-    nonisolated static let compactTypeKey = "monoCodeTextSizes"
+    nonisolated static let monoStyleKey = "monoCodeStyle"
     nonisolated static let defaultStrength = 0.5
     /// For renderers off the main thread (TypeScale), as `TextZoom.current`.
-    nonisolated static let compactTypeNow = Atomic<Bool>(true)
+    nonisolated static let monoStyleNow = Atomic<Bool>(true)
 
     var enabled: Bool { didSet { defaults.set(enabled, forKey: Self.enabledKey) } }
     /// 0...1, how much of the desktop shows through.
@@ -35,12 +36,14 @@ final class Glass {
             defaults.set(strength, forKey: Self.strengthKey)
         }
     }
-    var compactType: Bool {
+    /// MonoCode's text sizes (TypeScale.pick), its flat square-cornered
+    /// pills and send button under the message box, and grey bubbles.
+    var monoStyle: Bool {
         didSet {
-            defaults.set(compactType, forKey: Self.compactTypeKey)
-            Self.compactTypeNow.store(compactType, ordering: .relaxed)
-            // The transcript and the composer re-lay themselves out on the
-            // zoom's notice; new sizes need the same.
+            defaults.set(monoStyle, forKey: Self.monoStyleKey)
+            Self.monoStyleNow.store(monoStyle, ordering: .relaxed)
+            // The transcript and the composer re-lay and redraw themselves
+            // on the zoom's notice; new sizes and bubbles need the same.
             NotificationCenter.default.post(name: TextZoom.didChange, object: TextZoom.shared)
         }
     }
@@ -52,8 +55,8 @@ final class Glass {
         enabled = defaults.object(forKey: Self.enabledKey) as? Bool ?? true
         let saved = defaults.object(forKey: Self.strengthKey) as? Double ?? Self.defaultStrength
         strength = min(max(saved, 0), 1)
-        compactType = defaults.object(forKey: Self.compactTypeKey) as? Bool ?? true
-        Self.compactTypeNow.store(compactType, ordering: .relaxed)
+        monoStyle = defaults.object(forKey: Self.monoStyleKey) as? Bool ?? true
+        Self.monoStyleNow.store(monoStyle, ordering: .relaxed)
     }
 
     /// How opaque the tint over the blur is, under the whole window:
@@ -77,6 +80,11 @@ final class Glass {
             ? NSColor(srgbRed: 6 / 255, green: 6 / 255, blue: 6 / 255, alpha: 1)
             : .white
     })
+    /// The thread card's corners while glass is on, as MonoCode's 10 pt.
+    static var cardCorner: CGFloat { zoomed(10) }
+    /// The room left under the card, so its bottom corners show.
+    static var cardMargin: CGFloat { zoomed(6) }
+
     /// MonoCode's wash over the shell, which also shows in the 1 pt gaps
     /// between panels as their dividers: its text colour at 5%.
     static let wash = Color.primary.opacity(0.05)

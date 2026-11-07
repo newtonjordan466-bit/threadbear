@@ -21,7 +21,8 @@ struct ComposerView: View {
     @State private var importing = 0
     @State private var handle = ComposerHandle()
 
-    static var cornerRadius: CGFloat { zoomed(20) }
+    /// MonoCode's style (Glass.monoStyle) has 12 pt corners.
+    static var cornerRadius: CGFloat { TypeScale.pick(20, mono: 12) }
     static var padding: CGFloat { zoomed(14) }
 
     private var draftKey: String { thread?.id ?? "new" }
@@ -126,12 +127,14 @@ struct ComposerView: View {
     private func card(attention: Bool) -> some View {
         let shape = RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous)
         let dark = colorScheme == .dark
+        // MonoCode's style: a faint 4% fill inside a 10% outline.
+        let mono = Glass.shared.monoStyle
         return shape
             // About #2e2e2e on the #1c1c1c pane: at 0.05 the card was barely
             // lighter than the pane and read as an outline, not a card.
-            .fill(dark ? Color.primary.opacity(0.085) : Color.white)
+            .fill(dark ? Color.primary.opacity(mono ? 0.04 : 0.085) : Color.white)
             .shadow(color: .black.opacity(dark ? 0 : 0.08), radius: zoomed(14), y: zoomed(4))
-            .overlay(shape.strokeBorder(attention ? Color(nsColor: .controlAccentColor) : Color(nsColor: .separatorColor), lineWidth: attention ? 1 : 0.5))
+            .overlay(shape.strokeBorder(attention ? Color(nsColor: .controlAccentColor) : mono ? Color.primary.opacity(0.10) : Color(nsColor: .separatorColor), lineWidth: attention || mono ? 1 : 0.5))
             .contentShape(shape)
             .onTapGesture { app.focusComposer(draftKey) }
     }

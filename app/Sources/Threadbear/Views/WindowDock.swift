@@ -244,6 +244,8 @@ struct RootView: View {
             ActivityBar()
                 .zIndex(1)
             DockView(controller: app.dock, options: Self.options, content: content)
+                // Glass: room under the cards, so their corners show.
+                .padding(.bottom, Glass.shared.enabled ? Glass.cardMargin : 0)
             if let thread = app.paneThread {
                 PanelRail(thread: thread, project: app.openProject)
             }
@@ -318,6 +320,8 @@ struct RootView: View {
             let card = Glass.cardColor.opacity(glass.cardTint)
             o.dividers = Glass.wash
             o.panelFill = { $0 == WindowDock.threads ? .clear : card }
+            let corner = Glass.cardCorner
+            o.panelCorner = { $0 == WindowDock.threads ? 0 : corner }
         }
         return o
     }

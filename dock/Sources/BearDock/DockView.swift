@@ -82,6 +82,9 @@ public struct DockOptions {
     /// Nil: the window's colour. An app with a see-through window gives
     /// panels a tint here, or `.clear` to let it all show.
     public var panelFill: (@MainActor (PanelID) -> Color)?
+    /// Each panel's corner radius in the window, by the panel on show in
+    /// its group, so a tinted panel reads as a card. Nil: square.
+    public var panelCorner: (@MainActor (PanelID) -> CGFloat)?
 
     public init() {}
 }
@@ -397,7 +400,10 @@ struct GroupView: View {
                 .opacity(lifted ? 0.18 : 1)
                 .scaleEffect(lifted ? 0.985 : 1)
         }
-        .background(options.panelFill?(group.selected) ?? DockTheme.panel)
+        .background(
+            options.panelFill?(group.selected) ?? DockTheme.panel,
+            in: RoundedRectangle(cornerRadius: options.panelCorner?(group.selected) ?? 0, style: .continuous)
+        )
         .overlay(alignment: .top) {
             if !header && !corner {
                 HiddenTitleStrip(panel: group.selected)

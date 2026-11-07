@@ -21,7 +21,7 @@ enum RowMetrics {
     static var workingHeight: CGFloat { zoomed(34) }
     static var bubblePadH: CGFloat { zoomed(14) }
     static var bubblePadV: CGFloat { zoomed(10) }
-    static var bubbleRadius: CGFloat { zoomed(18) }
+    static var bubbleRadius: CGFloat { TypeScale.pick(18, mono: 12) }
     /// The widest a user bubble gets, as a share of the column.
     static let bubbleShare: CGFloat = 0.8
     static var boxPad: CGFloat { zoomed(10) }

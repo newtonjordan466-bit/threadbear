@@ -83,12 +83,12 @@ enum TypeScale {
         return percent == 100 ? size : (size * CGFloat(percent) / 100).rounded()
     }
 
-    /// MonoCode's text sizes (Glass.compactType, on by default) or
+    /// MonoCode's text sizes (Glass.monoStyle, on by default) or
     /// Threadbear's own, then scaled. MonoCode 0.16 sets replies at 14 on 24,
     /// titles at 13, headings at 12 and times and pills at 11.
     static var compact: Bool {
-        if Thread.isMainThread { return MainActor.assumeIsolated { Glass.shared.compactType } }
-        return Glass.compactTypeNow.load(ordering: .relaxed)
+        if Thread.isMainThread { return MainActor.assumeIsolated { Glass.shared.monoStyle } }
+        return Glass.monoStyleNow.load(ordering: .relaxed)
     }
 
     static func pick(_ threadbear: CGFloat, mono: CGFloat) -> CGFloat {
@@ -238,9 +238,12 @@ enum Theme {
     /// where thin grey glyphs on white read lighter than their colour.
     static let quietText = dynamic(dark: .secondaryLabelColor, light: NSColor(white: 0, alpha: 0.6))
 
-    /// The user's bubble: a touch of the accent colour over a faint fill.
+    /// The user's bubble: a touch of the accent colour over a faint fill,
+    /// or with MonoCode's style (Glass.monoStyle) its plain grey, the text
+    /// colour at 10% (6% in light).
     static let bubbleBackground = NSColor(name: nil) { appearance in
         let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        if TypeScale.compact { return NSColor(white: dark ? 235 / 255 : 46 / 255, alpha: dark ? 0.10 : 0.06) }
         let accent = NSColor.controlAccentColor.usingColorSpace(.sRGB) ?? .systemBlue
         let (base, baseAlpha, accentAlpha): (CGFloat, CGFloat, CGFloat) = dark ? (1, 0.06, 0.09) : (0, 0.035, 0.09)
         // `accent` at `accentAlpha` composited over `base` grey at `baseAlpha`.

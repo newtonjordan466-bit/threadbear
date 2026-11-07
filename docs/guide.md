@@ -429,17 +429,19 @@ Show or Hide Panels (⌥⌘P) for the panels beside the thread, and Reset
 Panel Layout, which puts everything back how it started. Threadbear remembers your
 layout between launches.
 
-### Glass and text sizes
+### Glass and MonoCode style
 
 The window is frosted glass to begin with: your desktop shows through it,
 blurred, in the style of MonoCode, with the list of threads the clearest
 part and the thread on a darker card. Settings (⌘,) > General >
 Appearance turns Glass off, and its See-through slider sets how much of
 the desktop shows, from MonoCode's own amount at the left to clearer at
-the right. MonoCode text sizes, in the same place, make replies, titles
-and the sidebar a point or so smaller, as MonoCode has them; turn it off
-for Threadbear's own sizes. Both are kept on this Mac and change straight
-away.
+the right. With glass on, the thread and the panels beside it sit on
+cards with rounded corners. MonoCode style, in the same place, makes
+replies, titles and the sidebar a point or so smaller, gives the message
+box flat grey pills and a square send button, and puts your messages in
+grey bubbles; turn it off for Threadbear's own look. Both are kept on
+this Mac and change straight away.
 
 ## Highlights
 <!-- slug: highlights -->

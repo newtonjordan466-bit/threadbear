@@ -144,15 +144,14 @@ private struct GeneralSettings: View {
     }
 }
 
-/// This Mac's own look (Glass): the frosted window and MonoCode's text
-/// sizes, kept in UserDefaults rather than the runner.
+/// This Mac's own look (Glass): the frosted window and MonoCode's style, kept in UserDefaults rather than the runner.
 private struct AppearanceSettings: View {
     private let glass = Glass.shared
 
     var body: some View {
         @Bindable var glass = glass
         SettingsSection("Appearance",
-                        about: "Glass lets your desktop show through the window, frosted, in the style of MonoCode. See-through sets how much shows: the left end is MonoCode's own amount, the right end clearer. MonoCode text sizes make replies, titles and the sidebar a point or so smaller, as MonoCode has them. Both are this Mac's own and change straight away.",
+                        about: "Glass lets your desktop show through the window, frosted, in the style of MonoCode. See-through sets how much shows: the left end is MonoCode's own amount, the right end clearer. MonoCode style makes replies, titles and the sidebar a point or so smaller, and gives the message box flat grey pills and your messages grey bubbles, as MonoCode has them. Both are this Mac's own and change straight away.",
                         ask: "change the colours, the type or the glass further than these do.") {
             Toggle("Glass", isOn: $glass.enabled)
                 .tip("Let the desktop show through the window, frosted")
@@ -162,8 +161,8 @@ private struct AppearanceSettings: View {
                     .tip("How much of the desktop shows through")
             }
             .disabled(!glass.enabled)
-            Toggle("MonoCode text sizes", isOn: $glass.compactType)
-                .tip("Slightly smaller text, as MonoCode has it")
+            Toggle("MonoCode style", isOn: $glass.monoStyle)
+                .tip("Smaller text, flat pills and grey bubbles, as MonoCode has them")
         }
     }
 }

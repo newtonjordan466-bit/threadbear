@@ -19,14 +19,14 @@ final class GlassTests: XCTestCase {
         defaults.removePersistentDomain(forName: suite)
         // Glass's sizes reach renderers through a shared atomic: put back
         // the shared model's, so other tests see what it says.
-        Glass.compactTypeNow.store(Glass.shared.compactType, ordering: .relaxed)
+        Glass.monoStyleNow.store(Glass.shared.monoStyle, ordering: .relaxed)
         super.tearDown()
     }
 
     func testGlassAndMonoCodeSizesStartOn() {
         let glass = Glass(defaults: defaults)
         XCTAssertTrue(glass.enabled)
-        XCTAssertTrue(glass.compactType)
+        XCTAssertTrue(glass.monoStyle)
         XCTAssertEqual(glass.strength, Glass.defaultStrength)
     }
 
@@ -34,12 +34,12 @@ final class GlassTests: XCTestCase {
         let glass = Glass(defaults: defaults)
         glass.enabled = false
         glass.strength = 0.8
-        glass.compactType = false
+        glass.monoStyle = false
 
         let again = Glass(defaults: defaults)
         XCTAssertFalse(again.enabled)
         XCTAssertEqual(again.strength, 0.8, accuracy: 0.0001)
-        XCTAssertFalse(again.compactType)
+        XCTAssertFalse(again.monoStyle)
     }
 
     func testStrengthStaysInRange() {
@@ -68,9 +68,9 @@ final class GlassTests: XCTestCase {
     /// MonoCode's 14 pt replies or Threadbear's 15 from it.
     func testTextSizesFollowTheChoiceOffTheMainThread() async {
         let glass = Glass(defaults: defaults)
-        glass.compactType = true
+        glass.monoStyle = true
         let mono = await Task.detached { TypeScale.body }.value
-        glass.compactType = false
+        glass.monoStyle = false
         let own = await Task.detached { TypeScale.body }.value
         let percent = CGFloat(TextZoom.current.load(ordering: .relaxed))
         XCTAssertEqual(mono, percent == 100 ? 14 : (14 * percent / 100).rounded())

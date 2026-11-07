@@ -12,13 +12,13 @@ final class TextZoomTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
-        monoCodeSizes = Glass.shared.compactType
-        Glass.shared.compactType = false
+        monoCodeSizes = Glass.shared.monoStyle
+        Glass.shared.monoStyle = false
     }
 
     override func tearDown() {
         TextZoom.shared.reset()
-        Glass.shared.compactType = monoCodeSizes
+        Glass.shared.monoStyle = monoCodeSizes
         super.tearDown()
     }
 

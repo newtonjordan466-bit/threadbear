@@ -20,6 +20,7 @@
 import { WebSocketServer } from 'ws';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 // The tour's sample threads, the runner's own (it runs TypeScript as it is).
 import { SAMPLE_THREADS } from '../../../runner/src/samples.ts';
@@ -107,7 +108,8 @@ let accounts = [
   },
   {
     id: 'claude-2', provider: 'claude', title: 'work@example.com', configDir: `${tokenStatsAccounts}/claude-2`,
-    defaultModel: 'claude-fable-5-1', models, email: 'work@example.com', plan: 'Team', note: 'Convex work only', usage: usage(95, 90, { notice: couldntCheck }),
+    defaultModel: 'claude-fable-5-1', models, email: 'work@example.com', plan: 'Team', note: 'Convex work only',
+    usage: usage(95, 90, { notice: couldntCheck, more: [{ kind: 'weekly_model', title: 'Weekly Fable', remainingPercent: 97, resetsAt: hoursFromNow(70) }] }),
   },
   {
     id: 'claude-3', provider: 'claude', title: 'mike+3@example.com', configDir: `${tokenStatsAccounts}/claude-3`,
@@ -173,10 +175,13 @@ function mockUsageStats(days) {
       hours.push([h, total - cacheRead - cacheWrite - output, output, cacheRead, cacheWrite]);
     }
     tokens.push({ accountId: a.id, hours });
-    for (const kind of ['weekly', 'five_hour']) {
-      const w = a.usage?.windows?.find((x) => x.kind === kind);
+    // A model's own week ("Weekly Fable") is charted too, under its title.
+    const charted = (a.usage?.windows ?? []).filter((x) => ['weekly', 'five_hour', 'weekly_model'].includes(x.kind));
+    for (const w of charted) {
+      const kind = w.kind;
       if (!w?.resetsAt) continue;
-      const length = (kind === 'weekly' ? 168 : 5) * HOUR;
+      const week = kind !== 'five_hour';
+      const length = (week ? 168 : 5) * HOUR;
       const reset = Date.parse(w.resetsAt);
       // Walk back from now, one window at a time: each goes from 100 down
       // to where it ended, the current one to what it says now.
@@ -185,7 +190,7 @@ function mockUsageStats(days) {
       let endPct = w.remainingPercent;
       for (let start = reset - length; end > since; start -= length) {
         const from = Math.max(start, since);
-        const steps = Math.max(2, Math.round((end - from) / (kind === 'weekly' ? 3 * HOUR : 20 * 60_000)));
+        const steps = Math.max(2, Math.round((end - from) / (week ? 3 * HOUR : 20 * 60_000)));
         const run = [];
         for (let k = 0; k <= steps; k++) {
           const t = from + ((end - from) * k) / steps;
@@ -194,11 +199,11 @@ function mockUsageStats(days) {
         }
         samples.unshift(...run);
         end = start - 1;
-        endPct = kind === 'weekly' ? 20 + rand() * 40 : 10 + rand() * 60;
+        endPct = week ? 20 + rand() * 40 : 10 + rand() * 60;
         // Only today's 5-hour windows: older ones say nothing more.
         if (kind === 'five_hour' && end < now - 15 * HOUR) break;
       }
-      limits.push({ accountId: a.id, kind, samples });
+      limits.push({ accountId: a.id, kind, ...(kind === 'weekly_model' ? { title: w.title } : {}), samples });
     }
   }
   return { generatedAt: iso(), ready: true, tokens, limits };
@@ -289,6 +294,7 @@ const devices = [
 let deviceSeq = devices.length;
 const deviceList = () => ({ devices: [...devices], site: DEMO_SITE });
 
+let mockInstructions = { text: '' };
 const settings = {
   defaultCwd: defaults.cwd, idleMinutes: 30, maxLiveCLIs: 6, followMain: true, bulletReplies: true, oneReply: true,
   models: {
@@ -323,6 +329,16 @@ const runners = [SELF_RUNNER, { id: 'runner_bruce', name: 'bruce', icon: 'macmin
 // runner hears of them through remoteThreads.list and remoteThreads.updated,
 // as the real runner passes on what the backend has.
 const BRUCE = 'runner_bruce';
+// Mike's runner order (backend API 58), every runner's id: set with
+// runners.setOrder and said back in remoteThreads.updated, as the real
+// runner passes on the backend's.
+// MOCK_MORE_RUNNERS=1 adds two more, for a list worth rearranging (only for
+// a look at Settings > Runners: the usual demo stays at two).
+const MORE_RUNNERS = process.env.MOCK_MORE_RUNNERS ? [
+  { id: 'runner_cloud', name: 'Hetzner Cloud', icon: 'cloud', online: true, lastSeenAt: new Date().toISOString() },
+  { id: 'runner_pixel', name: 'Pixel', icon: 'smartphone', online: true, lastSeenAt: new Date().toISOString() },
+] : [];
+let runnerOrder = ['runner_mock', BRUCE, ...MORE_RUNNERS.map((r) => r.id)];
 // Files on bruce's Mac that its threads name, for files.read from
 // /bruce/rpc (docs/protocol.md, "Other runners' threads"): the picture is a
 // real PNG, the rest text. None of these paths exist on this Mac.
@@ -332,7 +348,7 @@ const BRUCE_FILES = {
   blob: '/Users/bruce/Library/Application Support/Threadbear/threads/bruce_media/blobs/bruce_media_c0_0.txt',
 };
 const bruceModifiedAt = new Date(Date.now() - 3600_000).toISOString();
-addRemoteDemo();
+if (!process.env.TB_MOCK_NO_REMOTE) addRemoteDemo();
 /** The schedules (docs/protocol.md, "Schedules"), soonest first. */
 let schedules = [];
 addDemoSchedules();
@@ -607,6 +623,8 @@ async function dispatch(client, method, p) {
     }
     case 'threads.create': {
       if (!p.text) throw rpcError(-32602, 'text is required');
+      // New Thread on a project's page: every project checked first, as the runner does.
+      const startIn = (p.projectIds ?? []).map((id) => needProject(id));
       const threadId = 'th_' + crypto.randomBytes(6).toString('hex');
       const now = iso();
       // Like the runner: a login named pins the thread; otherwise a pool
@@ -625,8 +643,12 @@ async function dispatch(client, method, p) {
       };
       // Made over /bruce/rpc, it's bruce's: only bruce's clients hear of
       // it, and this runner's through remoteThreads.updated.
-      threads.set(threadId, { summary, events: [], inProgress: new Map(), timers: [], ...(client.as ? { runnerId: client.as } : {}) });
+      // `fresh`: started this session, so the librarian files it after its first turn
+      // (librarianFiles). The demo fixtures never are, so nothing they show changes.
+      threads.set(threadId, { summary, events: [], inProgress: new Map(), timers: [], fresh: true, ...(client.as ? { runnerId: client.as } : {}) });
+      for (const project of startIn) join(summary, project, 'mike', true);
       broadcastSummary(threadId);
+      if (startIn.length) broadcastProjects();
       setTimeout(() => fakeTurn(threadId, p.text, p.images ?? []), 10);
       return { thread: summary };
     }
@@ -668,6 +690,13 @@ async function dispatch(client, method, p) {
       const turnId = 'turn_' + crypto.randomBytes(4).toString('hex');
       setTimeout(() => fakeTurn(t.summary.id, p.text ?? '', p.images ?? [], turnId, undefined, { editOf: p.seq }), 10);
       return { turnId, rewound: { seq: rewound.seq, fromSeq: rewound.fromSeq, toSeq: rewound.toSeq, files } };
+    }
+    case 'threads.delete': {
+      const t = need(p.threadId);
+      if (t.interrupt) t.interrupt();
+      threads.delete(t.summary.id);
+      broadcast('thread.deleted', { threadId: t.summary.id });
+      return {};
     }
     case 'threads.interrupt': {
       const t = need(p.threadId);
@@ -792,6 +821,43 @@ async function dispatch(client, method, p) {
       broadcastSummary(t.summary.id);
       return { thread: t.summary };
     }
+    case 'buttons.list': {
+      // docs/protocol.md, "Reply buttons": every button the thread has.
+      const t = need(p.threadId);
+      return { buttons: [...(t.buttons?.values() ?? [])].map((button) => structuredClone(button)) };
+    }
+    case 'buttons.press': {
+      // Starts the thread or sends the message once, like the runner. It
+      // takes a moment (longer under mock.slow), and a button whose folder
+      // is "/gone" fails, so the app's pressing and failed pills can be seen.
+      const t = need(p.threadId);
+      const button = t.buttons?.get(p.buttonId);
+      if (!button) throw rpcError(-32602, `Button not found: ${p.buttonId}`);
+      if (button.pressed) return { button: structuredClone(button) };
+      await new Promise((resolve) => setTimeout(resolve, 600 + slow.queueMs));
+      const from = `[Sent by the agent in the thread "${t.summary.title}" (${t.summary.id.slice(0, 8)})]\n\n`;
+      let next;
+      try {
+        if (button.start?.cwd === '/gone') throw rpcError(-32602, 'Folder not found: /gone');
+        if (button.start) {
+          const made = await dispatch(client, 'threads.create', { text: from + button.start.text, title: button.start.title ?? button.title, cwd: button.start.cwd, permissionMode: button.start.permissionMode });
+          next = { ...button, pressed: { at: iso(), threadId: made.thread.id } };
+        } else {
+          need(button.send.threadId);
+          await dispatch(client, 'threads.send', { threadId: button.send.threadId, text: from + button.send.text });
+          next = { ...button, pressed: { at: iso(), threadId: button.send.threadId } };
+        }
+        delete next.failed;
+      } catch (e) {
+        const failed = { ...button, failed: { at: iso(), error: String(e.message ?? e).slice(0, 300) } };
+        t.buttons.set(failed.id, failed);
+        persist(t.summary.id, { type: 'button.updated', button: failed });
+        throw e;
+      }
+      t.buttons.set(next.id, next);
+      persist(t.summary.id, { type: 'button.updated', button: next });
+      return { button: structuredClone(next) };
+    }
     case 'reviews.list': {
       const t = need(p.threadId);
       return { reviews: [...(t.reviews?.values() ?? [])].filter((review) => review.status === 'pending').sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id)).map((review) => structuredClone(review)) };
@@ -840,8 +906,12 @@ async function dispatch(client, method, p) {
       } else if (p.decision === 'answered' && scriptedTurns().some((x) => x.answer && new RegExp(x.answer, 'i').test(Object.values(p.answers ?? {}).join(' ')))) {
         // A made-up turn that carries on from the answer (MOCK_SCRIPTED_TURNS, `answer`).
         const turn = scriptedTurns().find((x) => x.answer && new RegExp(x.answer, 'i').test(Object.values(p.answers ?? {}).join(' ')));
+        // A fresh turn, so the working line counts from the answer rather than from a
+        // fixture's question asked days ago ("Bear with me · 63h" in a clip).
+        const turnId = 'turn_answer_' + crypto.randomBytes(3).toString('hex');
+        persist(t.summary.id, { type: 'turn.started', turnId }, turnId);
         setStatus(t.summary.id, 'running', false);
-        playScripted(t.summary.id, 'turn_resolved', Date.now(), turn, () => false);
+        playScripted(t.summary.id, turnId, Date.now(), turn, () => false);
       } else {
         // A fixture's approval with no fake turn behind it: finish the turn.
         const text = p.decision === 'deny' ? 'OK, I left it alone.' : p.decision === 'answered' ? `Going with ${Object.values(p.answers ?? {}).join(', ') || 'that'}.` : 'Done.';
@@ -978,6 +1048,41 @@ async function dispatch(client, method, p) {
       if (p.question) return { answer: `About "${sel}": ${p.question} That's the mock runner's answer to a follow-up.`, model: 'mock' };
       return { answer: `**${sel}** is what the agent called this step. It means the smallest piece to move first, so the rest can follow.\n\n- It's in \`runner/src/explain.ts\`\n- Nothing here goes into the thread`, model: 'mock' };
     }
+    case 'threads.commands': {
+      // The palette's list (docs/protocol.md, "Slash commands"): Threadbear's
+      // own, the CLI's, then skills, as a real Claude thread lists them.
+      const t = need(p.threadId);
+      const codex = t.summary.provider === 'codex';
+      const own = [
+        { name: 'model', description: "Switch this thread's model", argumentHint: '[model]', source: 'threadbear' },
+        { name: 'effort', description: "Set this thread's effort level", argumentHint: '[low|medium|high|xhigh|max]', source: 'threadbear' },
+      ];
+      const cli = codex
+        ? [
+            { name: 'compact', description: 'Summarise the conversation so far to free up context', source: 'cli' },
+            { name: 'review', description: 'Review the uncommitted changes, or what you describe', argumentHint: '[instructions]', source: 'cli' },
+            { name: 'clear', description: 'Start a fresh session in this thread (the transcript stays)', source: 'threadbear' },
+            { name: 'status', description: "The model, effort, context used and the login's limits", source: 'threadbear' },
+          ]
+        : [
+            { name: 'clear', description: 'Clear conversation history and free up context', source: 'cli' },
+            { name: 'compact', description: 'Clear conversation history but keep a summary in context', argumentHint: '<optional custom summarization instructions>', source: 'cli' },
+            { name: 'context', description: 'Show current context usage', source: 'cli' },
+            { name: 'cost', description: 'Show the total cost and duration of the current session', source: 'cli', scope: 'system', aliases: ['usage', 'stats'] },
+            { name: 'config', description: 'Open config panel', source: 'cli' },
+            { name: 'init', description: 'Initialize a new CLAUDE.md file with codebase documentation', source: 'cli' },
+          ];
+      const skills = [
+        { name: 'code-review', description: 'Review the current diff, or a PR number, branch or path, for correctness bugs, at the effort level given first.', argumentHint: '[low|medium|high] [target]', source: 'skill', scope: 'user', path: `${os.homedir()}/.claude/skills/code-review/SKILL.md` },
+        { name: 'computercub', description: "Drive Mac apps and the parts of Chrome extensions can't reach, with the `computercub` command.", source: 'skill' },
+        { name: 'cloudflare', description: 'Cloudflare platform: Workers, Pages, KV, D1, R2 and the rest.', source: 'skill' },
+        { name: 'claude-api', description: 'Model ids, pricing, params and the Anthropic SDK.', source: 'skill' },
+        { name: 'deslop', description: 'A second-pass cleanup over AI-written code using the repo style guide.', source: 'skill', scope: 'project', path: `${t.summary.cwd}/.claude/skills/deslop/SKILL.md` },
+        { name: 'delegate', description: 'Get answers from other labs and models, and run consensus panels.', source: 'skill' },
+        { name: 'ship', description: 'Drive a branch to merge-ready: PR, checks, bot comments.', source: 'skill' },
+      ];
+      return { commands: [...own, ...cli, ...skills] };
+    }
     case 'threads.highlights': {
       const t = need(p.threadId);
       return highlights.get(t.summary.id) ?? { highlights: [], edited: [] };
@@ -1002,9 +1107,11 @@ async function dispatch(client, method, p) {
       list.highlights = list.highlights.filter((h) => h.id !== id);
       list.highlights.unshift({
         id, kind, title: p.title ?? (p.path ? path.basename(p.path) : p.url), path: p.path, url: p.url, how: 'pinned',
-        note: p.note, ...(p.show ? { show: true } : {}), seq: t.summary.lastSeq, lastSeq: t.summary.lastSeq, at: iso(),
+        note: p.note, seq: t.summary.lastSeq, lastSeq: t.summary.lastSeq, at: iso(),
       });
       t.summary.highlightsAt = iso();
+      // show is a panel request naming the pin, as the runner's (docs/protocol.md, "Highlights").
+      if (p.show) t.summary.panelRequest = { id: 'pr_' + crypto.randomBytes(4).toString('hex'), panel: 'highlights', title: list.highlights[0].title, highlight: id, at: iso() };
       broadcastSummary(t.summary.id);
       return { highlight: list.highlights[0] };
     }
@@ -1049,6 +1156,13 @@ async function dispatch(client, method, p) {
     case 'remoteThreads.list':
       if (oldRunner) throw rpcError(-32601, `Unknown method ${method}`);
       return remoteThreads(client);
+    case 'runners.setOrder': {
+      if (oldRunner) throw rpcError(-32601, `Unknown method ${method}`);
+      if (!Array.isArray(p.runnerIds) || !p.runnerIds.every((x) => typeof x === 'string')) throw rpcError(-32602, 'runnerIds must be a list of runner ids');
+      runnerOrder = [...new Set(p.runnerIds)];
+      for (const c of clients) if (c.authed && c.as === null) send(c, 'remoteThreads.updated', remoteThreads(c));
+      return {};
+    }
     case 'runners.list':
       if (oldRunner) throw rpcError(-32601, `Unknown method ${method}`);
       // With what each one's heartbeat says, for the Runners panel: bruce
@@ -1059,7 +1173,8 @@ async function dispatch(client, method, p) {
           ...(r.self
             ? { version: '0.1.0+20261105T064853Z-c4d90ca', release: '20261105T064853Z-c4d90ca', startedAt: iso(-16 * 60_000) }
             : { version: '0.1.0+20261104T221010Z-51ae514', release: '20261104T221010Z-51ae514', startedAt: iso(-26 * 3_600_000) }),
-        })),
+        })).concat(MORE_RUNNERS.map((r) => ({ id: r.id, name: r.name, icon: r.icon, online: true, lastSeenAt: iso(), self: false,
+          version: '0.1.0+20261104T221010Z-51ae514', release: '20261104T221010Z-51ae514', startedAt: iso(-3 * 3_600_000) }))),
       };
     case 'runners.stats': {
       // Each runner's machine figures, a little different each ask.
@@ -1156,6 +1271,12 @@ async function dispatch(client, method, p) {
       if (oldRunner) throw rpcError(-32601, `Unknown method ${method}`);
       if (p.refresh) connectors = { ...connectors, checkedAt: iso() };
       return { connectors };
+    case 'instructions.get':
+      return { instructions: mockInstructions };
+    case 'instructions.set':
+      mockInstructions = { text: p.text.trim() ? p.text.trim() + '\n' : '' };
+      broadcast('instructions.updated', { instructions: mockInstructions });
+      return { instructions: mockInstructions };
     case 'settings.get':
       return { settings };
     case 'settings.update': {
@@ -1324,6 +1445,16 @@ async function fakeTurn(threadId, text, images, turnId = 'turn_' + crypto.random
   persist(threadId, { type: 'turn.started', turnId }, turnId);
   setStatus(threadId, 'running');
 
+  // A provider refusal for checking the recovery offer, without sending
+  // anything to a real model. Codex's continuation runs normally.
+  if (t.summary.provider !== 'codex' && /mock refusal/i.test(text)) {
+    const error = "API Error: Opus 5.5's safeguards flagged this message. Claude Code can't respond to this message with Opus 5.5.\n\nTry rephrasing the request in a new session or change your model.\n\nDetails: [reasoning_extraction]";
+    persist(threadId, { type: 'error', message: error }, turnId);
+    persist(threadId, { type: 'turn.completed', turnId, outcome: 'failed', durationMs: 851, error }, turnId);
+    t.interrupt = undefined;
+    setStatus(threadId, 'error');
+    return;
+  }
   // Say "signed out" for a turn refused by the login, as Claude Code's
   // expired OAuth session does: the error row and errorKind auth, which
   // gets the thread its Sign in… line.
@@ -1341,6 +1472,32 @@ async function fakeTurn(threadId, text, images, turnId = 'turn_' + crypto.random
 
   const thinkId = 'r_' + crypto.randomBytes(4).toString('hex');
   persist(threadId, { type: 'reasoning', itemId: thinkId, text: 'Checking what the message asks for before answering.' }, turnId);
+
+  // "queued" in a message: an edit's card with the reply's other calls
+  // queued on it (docs/protocol.md, "Queued calls").
+  if (/queued/i.test(text)) {
+    const approvalId = 'ap_' + crypto.randomBytes(4).toString('hex');
+    const root = t.summary.cwd || '/Users/mike/dev/photo-sync';
+    const edit = (id, file, oldText, newText) => ({ itemId: id, name: 'Edit', title: `Edit ${file}`, input: { file_path: `${root}/${file}`, old_string: oldText, new_string: newText } });
+    const head = edit('q1', 'Tests/PreviewTests.swift', '        let started = Date()\n        _ = Preview.references(in: text)\n        XCTAssertLessThan(Date().timeIntervalSince(started), 10)', '        let seconds = cpuSeconds {\n            _ = Preview.references(in: text)\n        }\n        XCTAssertLessThan(seconds, 30)');
+    const calls = [
+      edit('q2', 'Tests/DraftTests.swift', '        let start = Date()', '        let seconds = cpuSeconds {\n            _ = Draft.parse(text)\n        }'),
+      { itemId: 'q3', name: 'Write', title: 'Write Tests/CPUTime.swift', input: { file_path: `${root}/Tests/CPUTime.swift`, content: 'import Darwin\n\n/// CPU time the block took, not wall time: a loaded machine\n/// doesn\'t fail the test.\nfunc cpuSeconds(_ body: () -> Void) -> Double {\n    let before = clock()\n    body()\n    return Double(clock() - before) / Double(CLOCKS_PER_SEC)\n}\n' } },
+      { itemId: 'q4', name: 'Bash', title: 'swift test --filter PreviewTests', input: { command: 'swift test --filter PreviewTests' } },
+    ];
+    for (const c of [head, ...calls]) persist(threadId, { type: 'tool.call', itemId: c.itemId, name: c.name, kind: c.name === 'Bash' ? 'command' : 'edit', title: c.title, input: c.input }, turnId);
+    persist(threadId, { type: 'approval.requested', approvalId, itemId: head.itemId, name: head.name, title: head.title, input: head.input, options: ['allow', 'allowAlways', 'deny'] }, turnId);
+    persist(threadId, { type: 'approval.queued', approvalId, calls }, turnId);
+    setStatus(threadId, 'waiting', true);
+    t.approvalWaiters ??= new Map();
+    const answer = await new Promise((resolve) => t.approvalWaiters.set(approvalId, resolve));
+    setStatus(threadId, 'running', false);
+    const answers = { [head.itemId]: answer.decision, ...(answer.queued ?? {}) };
+    for (const c of [head, ...calls]) persist(threadId, { type: 'tool.result', itemId: c.itemId, ok: answers[c.itemId] === 'allow', text: answers[c.itemId] === 'allow' ? 'Done.' : 'The user denied this.', truncated: false, images: [] }, turnId);
+    const allowed = Object.values(answers).filter((d) => d === 'allow').length;
+    persist(threadId, { type: 'assistant.text', itemId: 'm_' + crypto.randomBytes(4).toString('hex'), text: `Allowed ${allowed} of ${calls.length + 1}.` }, turnId);
+    return finishTurn(threadId, turnId, started, 'completed');
+  }
 
   if (/approval|ask me/i.test(text) || t.summary.permissionMode === 'ask') {
     const approvalId = 'ap_' + crypto.randomBytes(4).toString('hex');
@@ -1508,6 +1665,45 @@ function finishTurn(threadId, turnId, started, outcome, said) {
   t.interrupt = undefined;
   t.summary.needsYou = true;
   setStatus(threadId, 'idle');
+  if (t.fresh && t.events.filter((e) => e.type === 'turn.completed').length === 1) librarianFiles(threadId);
+}
+
+/**
+ * The librarian's look after a new thread's first turn, as the real one does it: the thread
+ * shows as the one it's looking at, then it's put in the project whose name it mentions
+ * ("Why does the Walkies map jump…" goes in Walkies), with the transcript's note, the row's
+ * project and a "Put it in Walkies" line in the Librarian view. A thread naming no project
+ * is left out, as a one-off. Timed so a screen recording can catch each step.
+ */
+function librarianFiles(threadId) {
+  const t = threads.get(threadId);
+  const s = t.summary;
+  if (s.projects?.length || s.archivedAt) return;
+  const asked = t.events.find((e) => e.type === 'user.message')?.text ?? '';
+  const words = `${s.title} ${asked}`.toLowerCase();
+  const project = projects.find((x) => !x.archived && new RegExp(`\\b${x.title.toLowerCase().replace(/[^a-z0-9 ]/g, '')}\\b`).test(words));
+  const before = librarian.current;
+  t.timers.push(setTimeout(() => {
+    librarian.current = { threadId, threadTitle: s.title, reason: 'first-turn', why: 'Its first turn ended', dueAt: iso(), startedAt: iso() };
+    librarian.state = 'working';
+    broadcastLibrarian();
+  }, 800));
+  t.timers.push(setTimeout(() => {
+    if (!threads.has(threadId) || s.archivedAt) return;
+    const entry = { id: 'l_' + crypto.randomBytes(3).toString('hex'), at: iso(), threadId, threadTitle: s.title, reason: 'first-turn', costUsd: 0.0022 };
+    if (project) {
+      join(s, project, 'librarian', false, iso(), `Asks about ${project.title}`);
+      persist(threadId, { type: 'system.note', text: `Put in ${project.title}` });
+      librarian.recent.unshift({ ...entry, outcome: 'joined', text: `Put it in ${project.title}`, projectIds: [project.id] });
+      broadcastProjects();
+    } else {
+      librarian.recent.unshift({ ...entry, outcome: 'nothing', text: 'Left it out: a one-off errand' });
+    }
+    librarian.looksToday += 1;
+    librarian.current = before;
+    broadcastSummary(threadId);
+    broadcastLibrarian();
+  }, 2600));
 }
 
 /**
@@ -1818,8 +2014,9 @@ function remoteThreads(client) {
     runners: [{
       id: BRUCE, name: bruce.name, icon: bruce.icon, online: true, lastSeenAt: iso(),
       rpcUrl: `ws://127.0.0.1:${port}/bruce/rpc`, tokenFile: path.join(dataDir, `secrets/runners/${BRUCE}.token`),
-    }],
+    }, ...MORE_RUNNERS],
     threads: rows,
+    order: runnerOrder,
   };
 }
 
@@ -1971,7 +2168,9 @@ function scheduleWake(threadId) {
       s.snoozedUntil = undefined;
       delete s.wakeWhen;
       s.needsYou = true;
-      // As the runner does: "Woke up" on the row until it's opened.
+      // As the runner does: a note in the thread, and "Woke up" on the row
+      // until it's opened.
+      persist(threadId, { type: 'system.note', text: 'Woke up from hibernating.' });
       s.woke = { at: iso(), ...(s.snoozedAt ? { since: s.snoozedAt } : {}) };
       delete s.snoozedAt;
       broadcastSummary(threadId);
@@ -2837,7 +3036,9 @@ function loadFixtures() {
       summary.asked ??= events.map(askedLine).findLast(Boolean);
       const reviews = new Map();
       for (const event of events) if (event.type === 'review.updated') reviews.set(event.review.id, event.review);
-      const t = { summary, events, reviews, inProgress: new Map(), timers: [], dir };
+      const buttons = new Map();
+      for (const event of events) if (event.type === 'button.updated') buttons.set(event.button.id, event.button);
+      const t = { summary, events, reviews, buttons, inProgress: new Map(), timers: [], dir };
       updateReviewCount(t);
       loaded.push(t);
     }

@@ -45,7 +45,10 @@ export function step(name, cmd, args, opts, io = {}) {
   const { say = console.log, write = (s) => process.stdout.write(s), error = console.error, spawn = spawnSync, tmpdir = os.tmpdir() } = io;
   write(`${name}... `);
   const started = Date.now();
-  const logFile = path.join(tmpdir, `threadbear-deploy-${process.pid}-${name.toLowerCase().replace(/[^a-z0-9]+/g, '-')}.log`);
+  // The name is cut short for the file: a rerun of a dozen failed files made
+  // a name past macOS's 255 bytes, and the update died with ENAMETOOLONG (7 Nov).
+  const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 60).replace(/-+$/, '');
+  const logFile = path.join(tmpdir, `threadbear-deploy-${process.pid}-${slug}.log`);
   const fd = fs.openSync(logFile, 'w');
   const r = spawn(cmd, args, { ...opts, stdio: ['ignore', fd, fd] });
   fs.closeSync(fd);
@@ -105,4 +108,16 @@ function readOr(file) {
 // node --test's summary names each failure as "test at <file>:<line>:<col>".
 export function failedTestFiles(output) {
   return [...new Set([...output.matchAll(/^test at (\S+?\.test\.ts):\d+:\d+$/gm)].map((m) => m[1]))];
+}
+
+// Whether the smoke test gives up on a release that hasn't said it's
+// listening after `waited` ms, with the Mac's one-minute load per core what
+// it is now. A healthy release listens in seconds; 90 s covers a busy Mac.
+// Past that it keeps waiting only while the Mac is overloaded (more than
+// twice as much to run as it has cores), up to ten minutes: on 6 Nov a load
+// of 94 on 18 cores failed a release that started in 7 s once it eased, and
+// a release that crashes is caught at once whatever the wait.
+export function smokeTimedOut(waited, loadPerCore) {
+  if (waited <= 90_000) return false;
+  return loadPerCore <= 2 || waited > 10 * 60_000;
 }

@@ -1,4 +1,5 @@
 import AppKit
+import AVKit
 import BearDock
 import SwiftUI
 import ThreadbearCore
@@ -8,6 +9,14 @@ extension AppModel {
     /// 30 Oct): beside the thread as a dock tab the images were too small
     /// to compare.
     func openReview(threadId: String, review: DesignReview) {
+        // Another Mac's review: its pictures and pages are files on that
+        // Mac, and read here they'd be whatever this Mac has at those paths
+        // (Codex review, 7 Nov). Its answers went to this Mac's runner too,
+        // which doesn't have it, so it never worked from here.
+        if let thread = threads[threadId], thread.isRemote {
+            errorMessage = "This review is on \(runnerName(of: thread) ?? "another Mac"). Open it there for now."
+            return
+        }
         let key = threadId + "/" + review.id
         if let existing = reviewWindows[key] {
             existing.session.receive(review)
@@ -38,7 +47,7 @@ extension AppModel {
     private func presentReviewWindow(_ session: ReviewSession) {
         let threadId = session.threadId
         let key = threadId + "/" + session.review.id
-        let controller = ReviewWindowController(session: session, threadTitle: threads[threadId]?.title ?? "Thread", back: { [weak self] in
+        let controller = ReviewWindowController(session: session, app: self, threadTitle: threads[threadId]?.title ?? "Thread", back: { [weak self] in
             self?.select(threadId)
             #if DEBUG
             if Automation.instanceId != nil { return }
@@ -114,7 +123,7 @@ final class ReviewWindowController: NSWindowController, NSWindowDelegate {
     let session: ReviewSession
     var onClose: (() -> Void)?
 
-    init(session: ReviewSession, threadTitle: String, back: @escaping () -> Void) {
+    init(session: ReviewSession, app: AppModel, threadTitle: String, back: @escaping () -> Void) {
         self.session = session
         // On the screen Threadbear's in, not wherever the mouse is.
         let screen = NSApp.keyWindow?.screen ?? NSApp.mainWindow?.screen ?? NSScreen.main
@@ -130,7 +139,14 @@ final class ReviewWindowController: NSWindowController, NSWindowDelegate {
         // whatever the last one was dragged to.
         super.init(window: window)
         window.delegate = self
-        window.contentView = NSHostingView(rootView: ReviewWindow(session: session, back: back, close: { [weak self] in self?.close() }).allowsWindowActivationEvents())
+        // The app, for a page's Open in Browser (LocalPagePreview).
+        // A window of its own doesn't inherit the main window's openURL, and
+        // the agent's notes in it are Markdown with links: they go through
+        // OpenGate as links from the thread (Codex's review, 8 Nov).
+        window.contentView = NSHostingView(rootView: ReviewWindow(session: session, back: back, close: { [weak self] in self?.close() })
+            .environment(app)
+            .environment(\.openURL, OpenGate.urlAction(files: .thread(session.threadId)))
+            .allowsWindowActivationEvents())
         // Up in the title bar rather than a row of their own, so the images
         // and the choices get that height. Wide enough for all of them, as an
         // accessory doesn't resize when some come and go.
@@ -214,12 +230,23 @@ final class ReviewNativeWindow: NSWindow {
                 if session.mode == .single { session.showAll() } else { session.browse(0) }
                 return
             case 53 where session.mode == .single: // Esc: out of a zoom, then out to all of them
-                if session.zoomed { session.zoom(.fit) } else { session.showAll() }
+                if stageIsZoomed { session.zoom(.fit) } else { session.showAll() }
                 return
             default: break
             }
         }
         super.keyDown(with: event)
+    }
+
+    /// Whether the stage is zoomed in right now. `session.zoomed` hears a
+    /// moment later (the stage tells it on the next turn of the main
+    /// queue), so Esc straight after a zoom, with the app busy, went out
+    /// to all of them rather than out of the zoom.
+    private var stageIsZoomed: Bool {
+        func zoomed(_ view: NSView) -> Bool {
+            (view as? ReviewImageScroll)?.isZoomedNow == true || view.subviews.contains(where: zoomed)
+        }
+        return contentView.map(zoomed) ?? false
     }
 }
 
@@ -242,6 +269,9 @@ private struct ReviewTitlebarButtons: View {
             Spacer(minLength: 0)
             if session.mode == .single {
                 icon("square.grid.2x2", "See them all (Esc)") { session.showAll() }
+            }
+            // A video or page has its own controls and scrolling; zoom is for pictures.
+            if session.mode == .single, session.shownShot?.media == nil {
                 icon(session.zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass",
                      session.zoomed ? "Fit the image in its space (\u{2318}0)" : "Show at full size. Scroll or pinch to zoom, drag to move around") {
                     session.zoom(session.zoomed ? .fit : .actual)
@@ -298,9 +328,11 @@ struct ReviewWindow: View {
                     Spacer()
                     if session.conflict && session.review.isPending {
                         Button("Save my draft") { Task { await session.keepMyDraft() } }
+                            .busy(session.saving)
                             .tip("Keep what you have here, over the copy that changed elsewhere")
                     } else if session.review.isPending {
                         Button("Try saving again") { Task { await session.saveNow() } }
+                            .busy(session.saving)
                             .tip("Save the draft to the runner again")
                     }
                 }.padding(12).background(Color.orange.opacity(0.1))
@@ -362,14 +394,17 @@ struct ReviewWindow: View {
                 }.buttonStyle(.plain)
                     .tip(session.peeking ? "Back to \(session.focusedOption?.id ?? "it") (or let go of Space)" : "Flick to \(baseline.title): click, or hold Space")
             }
-            if let link = option.url, let url = URL(string: link) {
-                Button { NSWorkspace.shared.open(url) } label: {
+            // Only a web page, which is all an option's url is for: a runner
+            // (maybe another Mac's) sends it, and a file: or another app's
+            // link would open whatever it named here (Daybreak, 7 Nov).
+            if let url = LinkPolicy.web(option.url) {
+                Button { OpenGate.openWeb(url) } label: {
                     Label("Open live", systemImage: "arrow.up.right")
                         .font(.system(size: TypeScale.detail, weight: .medium))
                         .padding(.horizontal, 11).frame(height: 26)
                         .background(Color.primary.opacity(0.08), in: Capsule())
                         .contentShape(Capsule())
-                }.buttonStyle(.plain).tip("Try \(option.id) running live: \(link)")
+                }.buttonStyle(.plain).tip("Try \(option.id) running live: \(url.absoluteString)")
             }
         }
         .padding(.horizontal, 22).padding(.top, 14)
@@ -380,7 +415,20 @@ struct ReviewWindow: View {
             let room = CGSize(width: max(0, geo.size.width - Self.stageInset * 2), height: max(0, geo.size.height - Self.stageInset * 2))
             Group {
                 if session.mode == .single, let shot = session.shownShot {
-                    enlarged(shot.image)
+                    if let video = shot.video {
+                        // Plays on its own, quietly, round and round, as
+                        // X does: the controls turn the sound up.
+                        ReviewVideo(url: video, controls: true)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .accessibilityLabel("\(session.shownOption?.label ?? ""), video")
+                    } else if let page = shot.page {
+                        LocalPagePreview(url: page, opened: 0)
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .accessibilityLabel("\(session.shownOption?.label ?? ""), page")
+                    } else {
+                        enlarged(shot.image)
+                    }
                 } else {
                     let layout = ReviewGalleryLayout.best(
                         aspects: session.review.options.map { aspect($0.image) }, width: room.width, height: room.height, spacing: Self.cellSpacing,
@@ -517,9 +565,22 @@ struct ReviewWindow: View {
                 Text(option.id).font(.system(size: TypeScale.detail, weight: .semibold))
                     .foregroundStyle(picked ? Color.accentColor : Color.secondary)
                 if count > 1 { Text("\(count) shots").font(.system(size: TypeScale.detail)).foregroundStyle(.tertiary) }
+                if session.review.recommended == option.id {
+                    Text("my pick").font(.system(size: TypeScale.detail)).foregroundStyle(Color.accentColor)
+                }
             }
             .lineLimit(1).frame(height: Self.captionHeight, alignment: .topLeading)
-            ReviewCanvas(image: option.image, onClick: { session.enlarge(index) })
+            Group {
+                // A clip plays side by side with the others, so they can
+                // be compared moving; a page shows its still, as a live
+                // page this small can't be read or used.
+                if let video = option.allShots.first?.video {
+                    ReviewVideo(url: video, controls: false)
+                        .overlay { Color.clear.contentShape(Rectangle()).onTapGesture { session.enlarge(index) } }
+                } else {
+                    ReviewCanvas(image: option.image, onClick: { session.enlarge(index) })
+                }
+            }
                 .tip("\(option.id): click to enlarge")
                 .frame(width: fit.width, height: fit.height)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -540,8 +601,11 @@ struct ReviewWindow: View {
         VStack(spacing: 0) {
             ScrollViewReader { scroller in ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
+                    // The agent's lead, as markdown in the text colour: drawn
+                    // raw in grey it was one long wall where backticks showed
+                    // and nothing stood out (Mike, 7 Nov).
                     if let note = session.review.note, !note.isEmpty {
-                        Text(note).font(.system(size: TypeScale.work)).foregroundStyle(.secondary)
+                        Text(AttributedString.inlineMarkdown(note)).font(.system(size: TypeScale.work)).lineSpacing(2)
                             .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
                             .padding(14)
                         Divider()
@@ -623,10 +687,14 @@ struct ReviewWindow: View {
     private func choiceText(_ option: ReviewOption) -> some View {
         HStack(alignment: .top, spacing: 0) {
             VStack(alignment: .leading, spacing: 3) {
-                Text(option.label).font(.system(size: TypeScale.work, weight: .semibold))
+                // The agent's pick, worded and coloured as on an asks card.
+                (Text(option.label).font(.system(size: TypeScale.work, weight: .semibold))
+                    + (session.review.recommended == option.id
+                        ? Text("  my pick").font(.system(size: TypeScale.detail)).foregroundStyle(Color.accentColor)
+                        : Text("")))
                     .fixedSize(horizontal: false, vertical: true)
                 if let reason = option.note, !reason.isEmpty {
-                    Text(reason).font(.system(size: TypeScale.detail)).foregroundStyle(.secondary)
+                    Text(AttributedString.inlineMarkdown(reason)).font(.system(size: TypeScale.detail)).foregroundStyle(.secondary).lineSpacing(1.5)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -721,6 +789,55 @@ struct ReviewWindow: View {
 
 /// A small picture of a shot, cropped from its top left, where a mockup's
 /// title and controls are, rather than squashed.
+/// A shot that's a video: muted and looping from the start. On the stage
+/// it has the player's controls, for sound and scrubbing; in a cell among
+/// them all it has none, and a click on it enlarges it.
+struct ReviewVideo: NSViewRepresentable {
+    let url: URL
+    let controls: Bool
+
+    final class Coordinator {
+        var url: URL?
+        var looper: AVPlayerLooper?
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    /// Never the window's first responder, so the arrow keys keep stepping
+    /// through the shots after a click on its controls, not scrubbing.
+    final class Player: AVPlayerView {
+        override var acceptsFirstResponder: Bool { false }
+    }
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let view = Player()
+        view.videoGravity = .resizeAspect
+        // Live Text over a paused frame would take the click.
+        view.allowsVideoFrameAnalysis = false
+        return view
+    }
+
+    func updateNSView(_ view: AVPlayerView, context: Context) {
+        view.controlsStyle = controls ? .floating : .none
+        guard context.coordinator.url != url else { return }
+        view.player?.pause()
+        let player = AVQueuePlayer()
+        player.isMuted = true
+        // Looping and quiet: it mustn't keep the Mac awake on its own.
+        player.preventsDisplaySleepDuringVideoPlayback = false
+        context.coordinator.looper = AVPlayerLooper(player: player, templateItem: AVPlayerItem(url: url))
+        context.coordinator.url = url
+        view.player = player
+        player.play()
+    }
+
+    static func dismantleNSView(_ view: AVPlayerView, coordinator: Coordinator) {
+        view.player?.pause()
+        coordinator.looper?.disableLooping()
+        view.player = nil
+    }
+}
+
 private struct ReviewThumb: View {
     let path: String
     let width: CGFloat
@@ -895,6 +1012,8 @@ final class ReviewImageScroll: NSScrollView {
     private var dragOrigin = NSPoint.zero
     var onClick: (() -> Void)?
     var onZoom: ((Bool) -> Void)?
+    /// What `onZoom` will say, before it's said.
+    var isZoomedNow: Bool { zoomable && magnification > fitScale * 1.001 }
 
     // The most zoomed in: 4 pixels on screen to one in the image.
     private static let furthest: CGFloat = 4

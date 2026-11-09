@@ -7,15 +7,17 @@
 // app needs no Convex of its own and no link to the other Mac.
 //
 // The backend has a thread's text, one line per tool call, its open approval
-// and its card, but not tool output, diffs or pictures (those wait for full
-// sync, step 4). A tool row's result says the output is kept on that runner,
-// and carries `heldBack: { runnerId, seq }` for step 4 to fetch the body by.
+// and its card. A tool row's result says the output is kept on that runner, and
+// carries `heldBack: { seq }`: opening that tool in the app asks for it
+// (threads.heldBody), and if that runner has full sync on (docs/full-convex.md
+// step 4) its output comes from the backend, once, as more events for the row.
 //
 // Seqs. The rows' seqs are the other runner's event seqs, with gaps where
 // events weren't mirrored. Each row's seq s becomes eight here: 8s a
 // turn.started, 8s+1 the row's own event, 8s+2 a tool's result, 8s+3 and
 // 8s+4 a card from an older runner that didn't say its seq (placed after the
-// newest row when first seen) and its answer, 8s+7 its turn's end. A card
+// newest row when first seen) and its answer (or else a fetched tool's diffs),
+// 8s+5 and 8s+6 a fetched tool's real call and result, 8s+7 its turn's end. A card
 // whose event seq p is known goes at 8p+1 and its answer at 8p+2 (p is never
 // a row's seq). So events made up from a row sit right beside it and stay in
 // order, and every one has a seq of its own. The app takes these threads' events with gaps
@@ -29,8 +31,8 @@ import type { Clock, TimerHandle } from './clock.ts';
 import type { Logger } from './log.ts';
 import type { Notification } from './runner.ts';
 import type { RemoteThread, RemoteThreads } from './thread-index.ts';
-import type { Post, Subscribe } from './sync.ts';
-import { ErrorCode, RpcError } from './protocol.ts';
+import type { Post, Subscribe, Upload } from './sync.ts';
+import { ErrorCode, RpcError, remoteCreateMode } from './protocol.ts';
 import { seal } from './secrets.ts';
 
 export const SCALE = 8;
@@ -39,6 +41,19 @@ export const SCALE = 8;
 // once it has said so for this long.
 const SETTLE_MS = 4000;
 const TAIL = 15;
+// How long a change made from here outranks the other runner's row in
+// replies (Relay.changed): the row catches up within seconds.
+const CHANGED_MS = 60_000;
+// Reading a shared thread's link from its row: an older runner writes the
+// row with its next batch rather than at once.
+const SHARE_READS = 5;
+const SHARE_READ_MS = 1000;
+// Hibernating until that runner restarts (runner.ts's UNTIL_RESTART, not
+// imported so this module doesn't load the whole runner).
+const UNTIL_RESTART = '9999-12-31T00:00:00.000Z';
+// Hibernated in words on that runner, its time not yet on the row (threads.hibernateWhen):
+// shown put away, and satisfied by any snoozed row.
+const PUT_AWAY = 'put-away';
 const PAGE = 50;
 // A watch nobody has subscribed for this long stops; its rows stay a while,
 // so opening the thread again reads only what's new.
@@ -48,6 +63,34 @@ const SWEEP_MS = 15_000;
 // How long an action waits to hear the other runner took it.
 const TAKE_MS = 20_000;
 const CALL_MS = 30_000;
+// A hibernate in words waits for that runner's model to say when (the app waits 150 s).
+const HIBERNATE_MS = 120_000;
+// Pictures in one message to another runner: what a command may carry
+// (convex/sync.ts MAX_COMMAND_FILES), as a phone's may.
+const MAX_PICTURES = 6;
+// The backend that takes them (convex/relay.ts commandPictures); an older
+// one drops them and sends the words alone. sync.ts RELAY_PICTURES_API_VERSION,
+// not imported so this module doesn't load the whole sync.
+const PICTURES_API = 63;
+// A send or a new thread with pictures answers within this, as the app gives
+// up on one at 120 s (RPCClient.sendTimeout) and then puts the draft back
+// while it may still go, so a send again would be a second one. Uploading
+// them has to be done by UPLOAD_BUDGET_MS (one more upload can start just
+// before it, at most POST_TIMEOUT_MS, 15 s), and if they're not all up by
+// QUEUE_BY_MS nothing is queued; every wait after that ends by
+// REPLY_BUDGET_MS (Codex's review, 8 Nov).
+const REPLY_BUDGET_MS = 100_000;
+const UPLOAD_BUDGET_MS = 60_000;
+const QUEUE_BY_MS = 75_000;
+// The least a wait gets once the budget has nearly gone.
+const LAST_WAIT_MS = 2_000;
+
+// sync:remoteBody's answer: null, or one that's gone, says nothing new.
+export type HeldBody =
+  | { state: 'text'; text: string; ok?: boolean; truncated?: boolean; input?: string; diffs?: string; images?: number; cut?: boolean }
+  | { state: 'withheld'; reason?: string }
+  | { state: 'expired' }
+  | null;
 
 export type RelayRow = {
   seq: number;
@@ -71,10 +114,12 @@ export type RelayThreadRow = {
   status: string;
   needs?: 'you' | 'nothing';
   pendingApproval?: Pending;
-  asks?: { action: string; why?: string; reply?: string; options?: string[]; suggested?: number; links?: { title: string; url: string }[]; ticked?: boolean }[];
+  asks?: { action: string; why?: string; reply?: string; options?: string[]; optionNotes?: string[]; suggested?: number; links?: { title: string; url: string }[]; ticked?: boolean }[];
   asksSeq?: number;
   next?: string[];
   lastActivityAt?: string;
+  // Whether it's shared (the threads row's `share`; the sidebar's table has none).
+  share?: { access?: string; slug?: unknown };
 };
 
 // slot: the request's relay seq; the answer goes at slot + 1.
@@ -89,6 +134,8 @@ type Watch = {
   cards: Map<string, Card>;
   // What Mike answered from here, for the card's resolution.
   decided: Map<string, { decision: string; message?: string }>;
+  // Tools opened in the app, each fetched once (threads.heldBody).
+  bodies: Map<number, HeldBody>;
   // Seqs already given to the app, in pages or live.
   given: Set<number>;
   unsub: (() => void)[];
@@ -102,11 +149,24 @@ type Watch = {
   settleTimer?: TimerHandle;
   // When it was last read whole (load or refresh), so an events-then-subscribe doesn't read twice.
   readAt?: number;
+  // The share the app was last told of (noteRow), as JSON.
+  shareSaid?: string;
 };
 
 export type RelayEvent = { seq: number; ts: string; threadId: string; turnId?: string; type: string; [k: string]: unknown };
 
-export type RelaySource = { post: Post; subscribe?: Subscribe; key: string };
+export type RelaySource = {
+  post: Post;
+  subscribe?: Subscribe;
+  key: string;
+  // The backend's API version, and file storage's upload, for pictures.
+  apiVersion?: number;
+  upload?: Upload;
+};
+// A picture the app imported for a message (media.import), read only from
+// this runner's inbox, so a client can't have any other file here posted to
+// Convex by naming it.
+export type ReadPicture = (file: string) => { bytes: Uint8Array; mediaType: string } | { skip: string };
 export type RelayDeps = {
   // The backend, with the owner key; undefined while sync is off or the
   // backend is older than API 44 (sync.ts relaySource).
@@ -114,6 +174,7 @@ export type RelayDeps = {
   // Other runners and their threads, as the sidebar has them (thread-index.ts).
   remote: () => RemoteThreads;
   publish: (n: Notification) => void;
+  readPicture?: ReadPicture;
   // Whether an app connection is subscribed to the thread (rpc.ts).
   subscribed: (threadId: string) => boolean;
   clock: Clock;
@@ -124,7 +185,7 @@ const RUNNING = new Set(['running', 'starting', 'waiting']);
 const TOOL_NAMES: Record<string, string> = { command: 'Bash', read: 'Read', edit: 'Edit', write: 'Write', search: 'Grep', web: 'WebFetch', task: 'Task' };
 
 /** A thread's held rows and row as transcript events, oldest first, in relay seqs. Pure, so a page and the live stream agree. */
-export function relayEvents(threadId: string, rows: RelayRow[], row: RelayThreadRow | null, cards: Card[], olderMore: boolean, runnerName: string, settled = true): RelayEvent[] {
+export function relayEvents(threadId: string, rows: RelayRow[], row: RelayThreadRow | null, cards: Card[], olderMore: boolean, runnerName: string, settled = true, bodies?: Map<number, HeldBody>): RelayEvent[] {
   const out: RelayEvent[] = [];
   const sorted = [...rows].sort((a, b) => a.seq - b.seq);
   // Stopped only once it has said so for a moment (SETTLE_MS).
@@ -151,13 +212,46 @@ export function relayEvents(threadId: string, rows: RelayRow[], row: RelayThread
       // Finished once anything follows it, or its turn has ended.
       if (next || !running) {
         out.push(env(base + 2, r, { type: 'tool.result', itemId, ok: true, text: `The output is kept on ${runnerName}.`, truncated: false, images: [], heldBack: { seq: r.seq } }));
+        const body = bodies?.get(r.seq);
+        if (body?.state === 'withheld') {
+          out.push(env(base + 6, r, { type: 'tool.result', itemId, ok: true, text: `This is kept on ${runnerName}: what this tool read or ran can hold secrets, so its output doesn't go through Convex.`, truncated: false, images: [] }));
+        } else if (body?.state === 'text') {
+          // The app fills in the row it has from these, by itemId.
+          let input: Record<string, unknown> = {};
+          try {
+            const parsed = body.input ? JSON.parse(body.input) : {};
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) input = parsed;
+          } catch {
+            // Shown without it.
+          }
+          out.push(env(base + 5, r, { type: 'tool.call', itemId, name: TOOL_NAMES[kind] ?? 'Tool', kind, title: r.text, input }));
+          let diffs: { path: string; hunks: unknown[] }[] = [];
+          try {
+            const parsed = body.diffs ? JSON.parse(body.diffs) : [];
+            if (Array.isArray(parsed)) diffs = parsed.filter((d) => typeof d?.path === 'string').map((d) => ({ path: d.path, hunks: Array.isArray(d.hunks) ? d.hunks : [] }));
+          } catch {
+            // Likewise.
+          }
+          // Two seqs for diffs, unless an old runner's card is on them. A tool that
+          // changed more files says which.
+          const free = [base + 3, base + 4].filter((seq) => !cards.some((c) => c.slot === seq || c.slot + 1 === seq));
+          const shown = diffs.slice(0, free.length);
+          shown.forEach((d, n) => out.push(env(free[n]!, r, { type: 'edit.diff', itemId, path: d.path, hunks: d.hunks })));
+          const more = diffs.slice(shown.length).map((d) => d.path);
+          const pictures = body.images ? `${body.images === 1 ? '1 picture is' : `${body.images} pictures are`} kept on ${runnerName}.` : '';
+          const notes = [more.length ? `Also changed: ${more.join(', ')}` : '', pictures].filter(Boolean).join('\n');
+          out.push(env(base + 6, r, { type: 'tool.result', itemId, ok: body.ok !== false, text: body.text + (notes ? `${body.text ? '\n\n' : ''}${notes}` : ''), truncated: body.truncated === true || body.cut === true, images: [] }));
+        }
       }
     }
     const ends = r.turn && (next ? next.turn !== r.turn : row !== null && !running);
     if (ends) {
       const started = Date.parse(turnStart.get(r.turn!) ?? r.at);
       const last = !next;
-      const asks = last && row?.needs === 'you' && row.asks?.length ? row.asks.map(({ ticked: _t, ...a }) => a) : undefined;
+      // Each with its `ticked: true`, as the summary has them: the relay
+      // has no seq after the turn's end for an asks.ticked, and without
+      // them a finished checklist read as outstanding again.
+      const asks = last && row?.needs === 'you' && row.asks?.length ? row.asks.map(({ ticked, ...a }) => (ticked ? { ...a, ticked: true } : a)) : undefined;
       out.push(
         env(base + 7, r, {
           type: 'turn.completed',
@@ -198,11 +292,28 @@ export function mergeTail(rows: Map<number, RelayRow>, tail: Page): { gapAfter?:
   return gap ? { gapAfter: newest } : {};
 }
 
+// Said before anything was queued for the other runner, so nothing can
+// come of it there (cross-runner.ts hands a claim back on these).
+export function notSent(e: unknown): unknown {
+  if (e && typeof e === 'object') (e as { notSent?: boolean }).notSent = true;
+  return e;
+}
+export function wasNotSent(e: unknown): boolean {
+  return Boolean(e && typeof e === 'object' && (e as { notSent?: boolean }).notSent);
+}
+
 export class Relay {
   private deps: RelayDeps;
   private watches = new Map<string, Watch>();
   // Threads made from here that the sidebar's list doesn't have yet.
   private made = new Map<string, RemoteThread>();
+  // Changes the other runner has made for us that its backend row may not
+  // show yet, kept a while so each reply carries them all: otherwise a
+  // markSeen answered after an archive, from the row that isn't archived
+  // yet, put the thread back in the app's inbox. Each field goes once the
+  // row shows it (so a later change from the phone isn't hidden) or after
+  // CHANGED_MS, whichever is first.
+  private changed = new Map<string, Map<keyof RemoteThread, { value: unknown; at: number }>>();
   private sweepTimer?: TimerHandle;
   private reads = 0;
   // What those reads brought back, as JSON bytes (about what Convex bills
@@ -246,6 +357,113 @@ export class Relay {
     return this.made.get(threadId);
   }
 
+  /**
+   * Another runner's thread as a ThreadSummary, from its sidebar row, as the
+   * app makes one (RemoteThreads.swift, `RemoteThread.summary`): no seqs in
+   * the row, so an unread one is lastSeq 1 and lastSeenSeq 0.
+   */
+  private summary(threadId: string): Record<string, unknown> {
+    const t = this.withChanges(threadId, this.find(threadId));
+    const thread: Record<string, unknown> = {
+      id: threadId,
+      title: t.title ?? '',
+      cwd: t.cwd ?? '',
+      accountId: t.accountId ?? '',
+      provider: t.provider || 'claude',
+      status: t.status ?? 'idle',
+      needsYou: t.needsYou ?? false,
+      preview: t.preview ?? '',
+      lastSeq: t.unread ? 1 : 0,
+      lastSeenSeq: 0,
+      runnerId: t.runnerId,
+    };
+    for (const k of ['model', 'createdAt', 'lastActivityAt', 'snoozedUntil', 'archivedAt', 'starredAt', 'startedBy', 'asked'] as const) {
+      if (t[k] !== undefined) thread[k] = t[k];
+    }
+    if (t.lastActivityAt) thread.updatedAt = t.lastActivityAt;
+    if (t.snoozedUntil === UNTIL_RESTART) thread.snoozedUntilRestart = true;
+    return thread;
+  }
+
+  /** The row with the changes made from here that it doesn't show yet (`changed`). */
+  private withChanges<T extends Partial<RemoteThread>>(threadId: string, row: T | undefined): T {
+    const kept = this.changed.get(threadId);
+    if (!kept) return { ...row } as T;
+    const now = this.deps.clock.now();
+    const t: Record<string, unknown> = { ...row };
+    for (const [k, c] of kept) {
+      if (now - c.at >= CHANGED_MS || (row && shows(k, row[k], c.value))) kept.delete(k);
+      else t[k] = c.value === PUT_AWAY ? UNTIL_RESTART : c.value;
+    }
+    if (!kept.size) this.changed.delete(threadId);
+    return t as T;
+  }
+
+  /**
+   * The sidebar's list of other runners' threads (remoteThreads.list and
+   * .updated) with the changes made from here on it, as the replies have
+   * them: a list sent because some other thread changed, before this one's
+   * row had caught up, put a thread just archived here back in the inbox.
+   */
+  overlay(remote: RemoteThreads): RemoteThreads {
+    if (!this.changed.size) return remote;
+    return { ...remote, threads: remote.threads.map((t) => (this.changed.has(t.threadId) ? this.withChanges(t.threadId, t) : t)) };
+  }
+
+  /** The thread's share as that runner's backend row has it: "people" (API 7) reads as off. */
+  private async shareOf(threadId: string): Promise<Share | undefined> {
+    const row = (await this.read('relay:remoteThread', { threadId })) as Pick<RelayThreadRow, 'share'> | null;
+    return toShare(row?.share);
+  }
+
+  /**
+   * A watched thread's share, said to the app as it changes there (the
+   * website's Stop sharing or New link), and on first reading the row if
+   * it's shared: the app keeps the last share it heard of through the
+   * sidebar's rows, which never have one, so without this it showed a
+   * dead link.
+   */
+  private noteShare(w: Watch): void {
+    if (!w.row) return;
+    const share = toShare(w.row.share);
+    const said = JSON.stringify(share ?? null);
+    if (said === w.shareSaid) return;
+    const first = w.shareSaid === undefined;
+    w.shareSaid = said;
+    if (first && !share) return;
+    this.deps.publish({ method: 'thread.updated', params: { thread: { ...this.summary(w.threadId), ...(share ? { share } : {}) } } } as unknown as Notification);
+  }
+
+  /** The share once the row shows it as asked, read a few times while the row catches up. */
+  private async sharedAs(w: Watch, access: 'off' | 'link', notSlug?: string): Promise<Share | undefined> {
+    for (let i = 0; ; i++) {
+      const share = await this.shareOf(w.threadId);
+      if (share && share.access === access && share.slug !== notSlug) {
+        // Said in this reply, so not again when the watch sees the row.
+        w.shareSaid = JSON.stringify(share);
+        return share;
+      }
+      // Off with no link ever made: nothing to show, and nothing to wait for.
+      if (access === 'off' && !share) return undefined;
+      if (i >= SHARE_READS - 1) break;
+      await new Promise<void>((r) => this.deps.clock.setTimeout(() => r(), SHARE_READ_MS));
+    }
+    // Not "done" without it: the app keeps the share it had, so an off it
+    // can't confirm would still show the link as on.
+    const name = this.runnerName(w.runnerId);
+    throw new RpcError(ErrorCode.other, access === 'link'
+      ? `${name} has shared it, but its link hasn't reached Convex yet. Open Share again in a moment.`
+      : `${name} has stopped sharing it, but Convex doesn't show that yet. Open Share again in a moment.`);
+  }
+
+  /** A change the other runner has done, for replies until its row shows it (`changed`). */
+  private remember(threadId: string, patch: Partial<RemoteThread>): void {
+    const at = this.deps.clock.now();
+    const kept = this.changed.get(threadId) ?? new Map();
+    for (const [k, value] of Object.entries(patch)) kept.set(k as keyof RemoteThread, { value, at });
+    this.changed.set(threadId, kept);
+  }
+
   private runner(runnerId: string) {
     return this.deps.remote().runners.find((r) => r.id === runnerId);
   }
@@ -259,7 +477,7 @@ export class Relay {
     const t = this.find(threadId);
     if (!t) throw new RpcError(ErrorCode.threadNotFound, `No thread ${threadId}.`);
     if (!w) {
-      w = { threadId, runnerId: t.runnerId, rows: new Map(), olderMore: true, loaded: false, row: null, cards: new Map(), decided: new Map(), given: new Set(), unsub: [], usedAt: this.deps.clock.now() };
+      w = { threadId, runnerId: t.runnerId, rows: new Map(), bodies: new Map(), olderMore: true, loaded: false, row: null, cards: new Map(), decided: new Map(), given: new Set(), unsub: [], usedAt: this.deps.clock.now() };
       this.watches.set(threadId, w);
     }
     w.usedAt = this.deps.clock.now();
@@ -277,7 +495,7 @@ export class Relay {
 
   private events(w: Watch): RelayEvent[] {
     const settled = w.stoppedAt === undefined || this.deps.clock.now() - w.stoppedAt >= SETTLE_MS;
-    return relayEvents(w.threadId, [...w.rows.values()], w.row, [...w.cards.values()], w.olderMore, this.runnerName(w.runnerId), settled);
+    return relayEvents(w.threadId, [...w.rows.values()], w.row, [...w.cards.values()], w.olderMore, this.runnerName(w.runnerId), settled, w.bodies);
   }
 
   // The row's open card, kept so it stays in the transcript once answered;
@@ -285,6 +503,7 @@ export class Relay {
   private noteRow(w: Watch, row: RelayThreadRow | null, live = false): void {
     const wasRunning = w.row ? RUNNING.has(w.row.status) : true;
     w.row = row;
+    this.noteShare(w);
     const running = row ? RUNNING.has(row.status) : true;
     // Ends its turn once its last messages have had a moment to arrive.
     if (!running && wasRunning && live) this.settle(w);
@@ -471,6 +690,10 @@ export class Relay {
 
   private sweep(): void {
     const now = this.deps.clock.now();
+    for (const [id, kept] of this.changed) {
+      for (const [k, c] of kept) if (now - c.at >= CHANGED_MS) kept.delete(k);
+      if (!kept.size) this.changed.delete(id);
+    }
     for (const [id, w] of this.watches) {
       if (this.deps.subscribed(id)) {
         w.idleSince = undefined;
@@ -494,11 +717,21 @@ export class Relay {
    * (or, with `done`, finished). A runner that's offline is said at once
    * rather than left to pick it up whenever it's back.
    */
-  private async command(runnerId: string, threadId: string | undefined, kind: string, args: Record<string, unknown>, opts: { done?: boolean; ms?: number } = {}): Promise<{ state: string; note?: string; threadId?: string; result?: unknown }> {
-    const runner = this.runner(runnerId);
-    const name = runner?.name ?? 'the other runner';
-    if (runner && !runner.online) throw new RpcError(ErrorCode.other, `${name} is offline, so that can't reach it now.`);
-    const src = this.src();
+  private async command(runnerId: string, threadId: string | undefined, kind: string, args: Record<string, unknown>, opts: { done?: boolean; ms?: number; settleBy?: number } = {}): Promise<{ state: string; note?: string; threadId?: string; result?: unknown }> {
+    // settleBy: a send carrying pictures, and when it must answer by
+    // (REPLY_BUDGET_MS). That runner marks it taken before it fetches them,
+    // and a fetch that fails then fails the command, so taken isn't enough
+    // to say it went: it waits for done until then, and only then takes
+    // taken as a yes. Still pending at TAKE_MS is queued, as for any send
+    // (Codex's review, 8 Nov).
+    const name = this.runnerName(runnerId);
+    this.mustBeOnline(runnerId);
+    let src: RelaySource;
+    try {
+      src = this.src();
+    } catch (e) {
+      throw notSent(e);
+    }
     let commandId: unknown;
     try {
       commandId = await src.post('mutation', 'relay:queueCommand', { key: src.key, runnerId, ...(threadId ? { threadId } : {}), kind, args });
@@ -507,10 +740,13 @@ export class Relay {
     }
     const subscribe = src.subscribe;
     if (!subscribe) return { state: 'pending' };
-    const ms = opts.ms ?? TAKE_MS;
+    // With a budget, even the first wait ends by it (the queue call itself may have been slow).
+    const ms = opts.settleBy !== undefined ? Math.max(LAST_WAIT_MS, Math.min(opts.ms ?? TAKE_MS, opts.settleBy - this.deps.clock.now())) : (opts.ms ?? TAKE_MS);
     return new Promise((resolve, reject) => {
       let unsub: (() => void) | undefined;
       let finished = false;
+      let taken: { state: string } | undefined;
+      const settleBy = opts.settleBy;
       const end = (f: () => void) => {
         if (finished) return;
         finished = true;
@@ -519,10 +755,15 @@ export class Relay {
         queueMicrotask(() => unsub?.());
         f();
       };
-      const timer = this.deps.clock.setTimeout(
-        () => end(() => (opts.done ? reject(new RpcError(ErrorCode.other, `${name} hasn't answered yet. It's waiting for it in Convex.`)) : resolve({ state: 'pending' }))),
-        ms,
-      );
+      const expire = () => {
+        const left = settleBy !== undefined ? settleBy - this.deps.clock.now() : 0;
+        if (taken && left > 0) {
+          timer = this.deps.clock.setTimeout(expire, left);
+          return;
+        }
+        end(() => (opts.done ? reject(new RpcError(ErrorCode.other, `${name} hasn't answered yet. It's waiting for it in Convex.`)) : resolve(taken ?? { state: 'pending' })));
+      };
+      let timer = this.deps.clock.setTimeout(expire, ms);
       unsub = subscribe(
         'relay:commandState',
         { key: src.key, commandId },
@@ -530,12 +771,95 @@ export class Relay {
           const s = v as { state: string; note?: string; threadId?: string; result?: unknown } | null;
           if (!s) return end(() => reject(new RpcError(ErrorCode.other, `${name} didn't get it.`)));
           if (s.state === 'failed') return end(() => reject(new RpcError(ErrorCode.other, s.note ?? `${name} couldn't do that.`)));
-          if (s.state === 'done' || (s.state === 'taken' && !opts.done)) return end(() => resolve(s));
+          if (s.state === 'taken' && settleBy !== undefined) taken = s;
+          else if (s.state === 'done' || (s.state === 'taken' && !opts.done)) return end(() => resolve(s));
         },
         (e) => end(() => reject(new RpcError(ErrorCode.other, String(e)))),
       );
       if (finished) unsub();
     });
+  }
+
+  // A tool opened in the app: fetched once, for as long as this thread is held, and
+  // its events go out like any late one. Nothing's there (full sync off on that
+  // runner, or a tool from before it): the row goes on saying it's kept there.
+  private async heldBody(w: Watch, seq: number | undefined): Promise<{ state: string | null }> {
+    if (seq === undefined || !Number.isSafeInteger(seq)) throw new RpcError(ErrorCode.other, 'seq is required');
+    const held = w.bodies.get(seq);
+    if (held) return { state: held.state };
+    let body: HeldBody = null;
+    try {
+      body = (await this.read('sync:remoteBody', { threadId: w.threadId, seq })) as HeldBody;
+    } catch (e) {
+      // A backend from before API 52, or Convex away: the stub stands.
+      this.deps.log.debug('relay could not fetch a tool body', { threadId: w.threadId, seq, error: String(e) });
+      return { state: null };
+    }
+    // Nothing yet can mean it hasn't gone up yet, and with no `ok` it hasn't answered
+    // yet (a tool still running in the background): asked again next time.
+    if (body && (body.state !== 'text' || body.ok !== undefined)) {
+      w.bodies.set(seq, body);
+      this.emit(w);
+    }
+    return { state: body?.state ?? null };
+  }
+
+  private mustBeOnline(runnerId: string): void {
+    const runner = this.runner(runnerId);
+    if (runner && !runner.online) throw notSent(new RpcError(ErrorCode.other, `${runner.name} is offline, so that can't reach it now.`));
+  }
+
+  /**
+   * A message's pictures for another runner (backend API 63, convex/relay.ts
+   * commandPictures): each read from this runner's inbox, where the app's
+   * media.import put it, and uploaded to file storage, then `run` queues
+   * the command naming them in order. The backend gives that runner a URL
+   * for each, as for a phone's photos, which it fetches as it takes the
+   * command, and deletes them once it's done. Ones uploaded for a command
+   * that then failed are discarded; one that did get queued is kept by the
+   * backend until its command is over, so discarding is always safe.
+   */
+  private async withPictures<T>(runnerId: string, raw: unknown, started: number, run: (images: string[]) => Promise<T>): Promise<T> {
+    if (!Array.isArray(raw) || !raw.length) return run([]);
+    const name = this.runnerName(runnerId);
+    if (raw.length > MAX_PICTURES) throw new RpcError(ErrorCode.badParams, `At most ${MAX_PICTURES} pictures go to ${name} in one message.`);
+    const files = raw.map((r) => (r && typeof r === 'object' && typeof (r as { path?: unknown }).path === 'string' ? (r as { path: string }).path : undefined));
+    if (files.some((f) => f === undefined)) throw new RpcError(ErrorCode.badParams, "A picture in that message isn't one.");
+    // Before uploading anything: a send to a runner that's away would fail anyway.
+    this.mustBeOnline(runnerId);
+    let src: RelaySource;
+    try {
+      src = this.src();
+    } catch (e) {
+      throw notSent(e);
+    }
+    const read = this.deps.readPicture;
+    if ((src.apiVersion ?? 0) < PICTURES_API || !src.upload || !read) {
+      throw new RpcError(ErrorCode.other, `Pictures can go to ${name} once your Convex backend is updated, which happens with the next runner update. Send it from this Mac for now, or without the pictures.`);
+    }
+    const tooSlow = () => new RpcError(ErrorCode.other, `The pictures took too long to upload to Convex, so nothing went to ${name}. Try fewer or smaller ones.`);
+    const pictures = files.map((f) => {
+      const r = read(f!);
+      if ('skip' in r) throw new RpcError(ErrorCode.badParams, `A picture can't go to ${name}: ${r.skip}.`);
+      return r;
+    });
+    const ids: string[] = [];
+    try {
+      for (const pic of pictures) {
+        if (this.deps.clock.now() - started > UPLOAD_BUDGET_MS) throw tooSlow();
+        // Recorded by the backend (relayUploads), so one that never goes out is swept after a day.
+        const url = (await src.post('mutation', 'relay:pictureUploadUrl', { key: src.key })) as string;
+        ids.push(await src.upload(url, pic.bytes, pic.mediaType));
+      }
+      if (this.deps.clock.now() - started > QUEUE_BY_MS) throw tooSlow();
+      return await run(ids);
+    } catch (e) {
+      if (ids.length) {
+        await src.post('mutation', 'relay:discardPictures', { key: src.key, storageIds: ids }).catch((err) => this.deps.log.warn('relay pictures not discarded', { error: String(err) }));
+      }
+      if (e instanceof RpcError) throw e;
+      throw new RpcError(ErrorCode.other, `Couldn't send the pictures to ${name}: ${(e as Error)?.message ?? e}`);
+    }
   }
 
   private unsupported(w: Watch | undefined, what: string): never {
@@ -550,6 +874,7 @@ export class Relay {
       case 'threads.events':
         return this.page(w, { afterSeq: num(p.afterSeq), beforeSeq: num(p.beforeSeq), limit: num(p.limit) });
       case 'threads.subscribe': {
+        const said = w.shareSaid;
         await this.load(w);
         const after = num(p.afterSeq) ?? 0;
         // What's past the app's last seq, and anything that can come late
@@ -562,13 +887,25 @@ export class Relay {
         for (const e of events) w.given.add(e.seq);
         if (!w.given.size) w.given.add(after);
         this.live(w);
+        // An app subscribing may be new (relaunched) and not know the share
+        // the watch said before: said again, if it's shared (unless reading
+        // the row just now said it).
+        if (w.shareSaid === said) {
+          w.shareSaid = undefined;
+          this.noteShare(w);
+        }
         return { events, inProgress: [] };
       }
+      case 'threads.heldBody':
+        return this.heldBody(w, num(p.seq));
       case 'threads.send': {
-        if (Array.isArray(p.images) && p.images.length) this.unsupported(w, 'Sending pictures to another Mac');
         const text = typeof p.text === 'string' ? p.text : '';
-        await this.command(w.runnerId, threadId, 'send', { text, ...(Array.isArray(p.answers) && p.answers.length ? { answers: p.answers } : {}) });
-        return { turnId: '' };
+        const started = this.deps.clock.now();
+        const r = await this.withPictures(w.runnerId, p.images, started, (images) =>
+          this.command(w.runnerId, threadId, 'send', { text, ...(Array.isArray(p.answers) && p.answers.length ? { answers: p.answers } : {}), ...(images.length ? { images } : {}) }, images.length ? { settleBy: started + REPLY_BUDGET_MS } : {}),
+        );
+        // Not taken in TAKE_MS: it waits in the backend for that runner.
+        return { turnId: '', ...(r.state === 'pending' ? { queued: true } : {}) };
       }
       case 'threads.interrupt':
         await this.command(w.runnerId, threadId, 'interrupt', {});
@@ -605,23 +942,78 @@ export class Relay {
       }
       case 'threads.markSeen': {
         // A write on the other runner and the backend: only when there's something unread.
-        if (this.find(threadId)?.unread) await this.command(w.runnerId, threadId, 'update', { markSeen: true }).catch(() => undefined);
-        return {};
+        if (this.find(threadId)?.unread) {
+          await this.command(w.runnerId, threadId, 'update', { markSeen: true }).then(
+            () => this.remember(threadId, { unread: false }),
+            () => undefined,
+          );
+        }
+        return { thread: this.summary(threadId) };
       }
       case 'threads.update': {
-        const changes: Record<string, unknown>[] = [];
-        if (typeof p.title === 'string') changes.push({ title: p.title });
-        if (typeof p.archived === 'boolean') changes.push(p.archived ? { archive: true, ...(typeof p.verdict === 'string' ? { verdict: p.verdict } : {}) } : { unarchive: true });
-        if (typeof p.starred === 'boolean') changes.push({ star: p.starred });
-        if ('snoozedUntil' in p) changes.push(p.snoozedUntil === null ? { wake: true } : p.snoozedUntil === 'restart' ? { snooze: { untilRestart: true } } : { snooze: { until: String(p.snoozedUntil) } });
-        const known = new Set(['threadId', 'title', 'archived', 'verdict', 'starred', 'snoozedUntil']);
+        // Each command with what it changes on the row, for the reply.
+        const now = new Date(this.deps.clock.now()).toISOString();
+        const t = this.find(threadId);
+        const changes: [Record<string, unknown>, Partial<RemoteThread>][] = [];
+        if (typeof p.title === 'string') changes.push([{ title: p.title }, { title: p.title }]);
+        if (typeof p.archived === 'boolean') {
+          changes.push(p.archived ? [{ archive: true, ...(typeof p.verdict === 'string' ? { verdict: p.verdict } : {}), ...(p.archivedBy === 'agent' ? { by: 'agent' } : {}) }, { archivedAt: now }] : [{ unarchive: true }, { archivedAt: undefined }]);
+        }
+        if (typeof p.starred === 'boolean') changes.push([{ star: p.starred }, { starredAt: p.starred ? (t?.starredAt ?? now) : undefined }]);
+        if ('snoozedUntil' in p) {
+          const s = p.snoozedUntil;
+          changes.push(s === null ? [{ wake: true }, { snoozedUntil: undefined }] : s === 'restart' ? [{ snooze: { untilRestart: true } }, { snoozedUntil: UNTIL_RESTART }] : [{ snooze: { until: String(s) } }, { snoozedUntil: String(s) }]);
+        }
+        const known = new Set(['threadId', 'title', 'archived', 'verdict', 'archivedBy', 'starred', 'snoozedUntil']);
         if (Object.keys(p).some((k) => !known.has(k) && p[k] !== undefined)) this.unsupported(w, 'Changing its login, model or settings');
-        for (const change of changes) await this.command(w.runnerId, threadId, 'update', change, { done: true });
-        return {};
+        // Kept as each is done, so one failing after another went through
+        // doesn't lose the one that did.
+        for (const [change, patch] of changes) {
+          await this.command(w.runnerId, threadId, 'update', change, { done: true });
+          this.remember(threadId, patch);
+        }
+        // The app takes `{ thread }` back, as from any runner, and decodes
+        // nothing else: `{}` failed every archive of another runner's thread
+        // with a "Key 'thread' not found" banner after it had gone through.
+        return { thread: this.summary(threadId) };
+      }
+      case 'threads.hibernateWhen': {
+        // An `update` with the words: that runner's hibernateWhen puts the
+        // thread away at once (its row shows it) and the command is done
+        // once its model has said when, or failed with why. The backend
+        // keeps no result for an update, so `until`, `topic` and `why`
+        // aren't answered; the row carries the time. `untilRestart` is for
+        // a runner from before this, which reads only the time: it puts the
+        // thread away until it next starts rather than waking it.
+        const said = typeof p.said === 'string' ? p.said.trim() : '';
+        if (!said) throw new RpcError(ErrorCode.badParams, 'Say when it should wake.');
+        if (said.length > 300) throw new RpcError(ErrorCode.badParams, 'Say it in 300 characters or fewer.');
+        const before = this.find(threadId)?.snoozedUntil;
+        await this.command(w.runnerId, threadId, 'update', { snooze: { said, untilRestart: true } }, { done: true, ms: HIBERNATE_MS });
+        // Done can come before the row with its wake time: wait a little
+        // for it, and failing that answer it as put away, so the app
+        // doesn't put an awake row over its own guess. The row's real time
+        // replaces it when it comes.
+        for (let i = 0; i < SHARE_READS && this.find(threadId)?.snoozedUntil === before; i++) {
+          await new Promise<void>((r) => this.deps.clock.setTimeout(() => r(), SHARE_READ_MS / 4));
+        }
+        // Kept for the sidebar's list too, until any snoozed row comes (or
+        // CHANGED_MS), so an update of the awake row can't bring it back.
+        if (this.find(threadId)?.snoozedUntil === before) this.remember(threadId, { snoozedUntil: PUT_AWAY });
+        return { thread: this.summary(threadId) };
       }
       case 'threads.share': {
-        await this.command(w.runnerId, threadId, 'share', { access: p.access, ...(p.newLink === true ? { newLink: true } : {}) }, { done: true });
-        return {};
+        const access = p.access;
+        if (access !== 'off' && access !== 'link') throw new RpcError(ErrorCode.badParams, 'access must be "off" or "link"');
+        const newLink = p.newLink === true;
+        // A new link is one whose slug isn't the old one.
+        const old = newLink ? (await this.shareOf(threadId))?.slug : undefined;
+        await this.command(w.runnerId, threadId, 'share', { access, ...(newLink ? { newLink: true } : {}) }, { done: true });
+        // The command says nothing back, and the app shows the link from
+        // the reply, so it's read from that runner's row, which it writes
+        // as soon as it has shared (sync.ts, the share command).
+        const share = await this.sharedAs(w, access, old);
+        return { thread: { ...this.summary(threadId), ...(share ? { share } : {}) } };
       }
       case 'threads.subagent':
         return this.unsupported(w, "Reading a sub-agent's work");
@@ -632,15 +1024,17 @@ export class Relay {
 
   /** threads.create with a runnerId that's another runner's: a `create` command, answered with the new thread's id. */
   async create(runnerId: string, p: Record<string, unknown>): Promise<{ thread: Record<string, unknown> }> {
-    if (Array.isArray(p.images) && p.images.length) this.unsupported(undefined, 'Sending pictures to another Mac');
     const args: Record<string, unknown> = { text: String(p.text ?? '') };
     for (const k of ['cwd', 'accountId', 'model', 'effort']) if (typeof p[k] === 'string') args[k] = p[k];
-    // "Ask before edits": left out, that runner would give it full access.
-    // A runner from before step 5 ignores it (full access), as it would a
-    // phone's; every runner follows main within minutes, and the sidebar
-    // list doesn't say a runner's release to check against.
-    if (p.permissionMode === 'ask' || p.permissionMode === 'full' || p.permissionMode === 'auto') args.permissionMode = p.permissionMode;
-    const done = await this.command(runnerId, undefined, 'create', args, { done: true, ms: CALL_MS });
+    // Left out, that runner would give it full access, so every mode goes
+    // (Plan first as Ask plus a flag, which an older runner reads as Ask)
+    // and one this runner doesn't know is refused (remoteCreateMode).
+    Object.assign(args, remoteCreateMode(p.permissionMode));
+    const started = this.deps.clock.now();
+    // With pictures, the fetch is part of the wait: whatever's left of REPLY_BUDGET_MS.
+    const done = await this.withPictures(runnerId, p.images, started, (images) =>
+      this.command(runnerId, undefined, 'create', { ...args, ...(images.length ? { images } : {}) }, images.length ? { done: true, ms: REPLY_BUDGET_MS, settleBy: started + REPLY_BUDGET_MS } : { done: true, ms: CALL_MS }),
+    );
     if (!done.threadId) throw new RpcError(ErrorCode.other, `${this.runnerName(runnerId)} didn't say which thread it made.`);
     const now = new Date(this.deps.clock.now()).toISOString();
     // Opened at once, before the sidebar's list has its row.
@@ -693,6 +1087,23 @@ export class Relay {
   }
 }
 
+type Share = { access: 'off' | 'link'; slug: string };
+
+// A threads row's share as the app takes it: "people" (API 7) reads as off.
+function toShare(s: RelayThreadRow['share']): Share | undefined {
+  if (!s || typeof s.slug !== 'string') return undefined;
+  return { access: s.access === 'link' ? 'link' : 'off', slug: s.slug };
+}
+
+// Whether the other runner's row already shows a change made from here:
+// its own times for archiving and starring, so only whether it's set.
+function shows(k: keyof RemoteThread, row: unknown, kept: unknown): boolean {
+  if (kept === PUT_AWAY) return typeof row === 'string';
+  if (k === 'archivedAt' || k === 'starredAt') return (row !== undefined) === (kept !== undefined);
+  if (k === 'snoozedUntil' && typeof row === 'string' && typeof kept === 'string') return Date.parse(row) === Date.parse(kept);
+  return row === kept;
+}
+
 // The row has the input as one line; the card draws it under the key a
 // tool's input would have had, so a command reads as a command.
 function inputKey(name: string, line: string): string {
@@ -709,8 +1120,6 @@ function describe(method: string): string {
   switch (method) {
     case 'threads.edit':
       return 'Editing a message';
-    case 'threads.hibernateWhen':
-      return 'Hibernating until something happens';
     case 'threads.highlights':
     case 'threads.removeHighlight':
       return 'Its highlights';
@@ -721,6 +1130,6 @@ function describe(method: string): string {
     case 'threads.delete':
       return 'Deleting it';
     default:
-      return method.startsWith('panels.') || method.startsWith('actions.') ? 'Its patches' : method.startsWith('reviews.') ? 'Design reviews' : 'That';
+      return method.startsWith('panels.') || method.startsWith('actions.') || method.startsWith('patches.') ? 'Its patches' : method.startsWith('reviews.') ? 'Design reviews' : method.startsWith('buttons.') ? 'Reply buttons' : 'That';
   }
 }

@@ -38,6 +38,9 @@ public enum RowKind: String, Sendable, Hashable, CaseIterable {
     case group, working, background, changes
     /// The time between a turn and the one the agent started by itself after it.
     case gap
+    /// "Plan first": the agent's plan, to approve or send back, which then
+    /// turns into its checklist.
+    case planCard
 }
 
 public struct TextItem: Sendable, Hashable {
@@ -228,6 +231,25 @@ public struct ToolItem: Sendable, Hashable {
     }
 }
 
+/// "Plan first" (docs/protocol.md): the plan the agent put to Mike. Waiting,
+/// it offers Go ahead and Send back; approved, the steps it then works
+/// through (plan.updated) show here as its checklist, the plan behind
+/// "Show plan".
+public struct PlanCard: Sendable, Hashable {
+    public enum State: Sendable, Hashable { case waiting, approved, sentBack }
+    public var itemId: String
+    public var text: String
+    public var state: State
+    public var entries: [PlanEntry]
+
+    public init(itemId: String, text: String, state: State = .waiting, entries: [PlanEntry] = []) {
+        self.itemId = itemId
+        self.text = text
+        self.state = state
+        self.entries = entries
+    }
+}
+
 public struct ApprovalItem: Sendable, Hashable {
     public var request: ApprovalRequest
     public var resolution: ApprovalResolution?
@@ -238,13 +260,34 @@ public struct ApprovalItem: Sendable, Hashable {
     /// opened, "Allowed  Write release.sh" showed the file and the Write
     /// row right under it showed it again.
     public var toolShown: Bool
+    /// Another runner asking for a thread: the request as it was filed,
+    /// once this Mac's runner has read it (nil until then).
+    public var startRequest: StartRequest?
+    /// The agent's other calls waiting behind this one, shown on the same
+    /// card (docs/protocol.md, "Queued calls"). Empty for most cards.
+    ///
+    /// Always empty on another runner's start request, and a start request
+    /// is never one of the queued calls. Both come from the runner that
+    /// owns the thread, which may be a secondary one: a queue on the card
+    /// swapped the request this Mac's runner read (where, which access, the
+    /// brief) for the runner's own harmless-looking calls, while Allow
+    /// still started what was filed (Daybreak, 8 Nov). A start request is
+    /// only ever shown and answered as itself.
+    public var queued: [ApprovalRequest] {
+        get { isStartRequest ? [] : queuedCalls }
+        set { queuedCalls = newValue.filter { $0.name != StartRequest.cardName } }
+    }
+    private var queuedCalls: [ApprovalRequest] = []
 
-    public init(request: ApprovalRequest, resolution: ApprovalResolution? = nil, root: String? = nil, toolShown: Bool = false) {
+    public init(request: ApprovalRequest, resolution: ApprovalResolution? = nil, root: String? = nil, toolShown: Bool = false, startRequest: StartRequest? = nil) {
         self.request = request
         self.resolution = resolution
         self.root = root
         self.toolShown = toolShown
+        self.startRequest = startRequest
     }
+
+    public var isStartRequest: Bool { request.name == StartRequest.cardName }
 
     /// It shows what it asked: always while it waits (a card then), and
     /// once settled only if its tool call has no row to show it.
@@ -290,6 +333,17 @@ public struct SecretItem: Sendable, Hashable {
     }
 }
 
+public extension RowContent {
+    /// The note a thread back from hibernating says so in. The runner words
+    /// it (`wake` in runner/src/runner/hibernation.ts), and every way it says
+    /// it starts like this. It's what Mike came to the thread to read, so it
+    /// never folds into the work above it, and it gets the bear.
+    var isWakeNote: Bool {
+        if case .note(let text) = self { return text.hasPrefix("Woke up") }
+        return false
+    }
+}
+
 public enum RowContent: Sendable, Hashable {
     case user(UserMessage)
     case assistant(TextItem)
@@ -303,6 +357,7 @@ public enum RowContent: Sendable, Hashable {
     case secret(SecretItem)
     case review(DesignReview)
     case plan([PlanEntry])
+    case planCard(PlanCard)
     case footer(TurnCompletion)
     /// The asks a finished turn left for Mike, under its footer.
     case asks(AsksCard)
@@ -331,6 +386,7 @@ public enum RowContent: Sendable, Hashable {
         case .secret: return .secret
         case .review: return .review
         case .plan: return .plan
+        case .planCard: return .planCard
         case .footer: return .footer
         case .asks: return .asks
         case .note: return .note
@@ -384,9 +440,13 @@ public struct AsksCard: Sendable, Hashable {
     /// picked Something else on, by ask index. The card makes room for
     /// each box from it; the box itself is a text view over that room.
     public var notes: [Int: AskNote]
+    /// The done card's loose ends, as the runner checked them (protocol
+    /// "Loose ends"): nil when it didn't, empty when nothing's left.
+    public var looseEnds: [LooseEnd]?
 
-    public init(seq: Int, asks: [Ask], ticked: Set<Int> = [], isOpen: Bool = true, picks: [Int: Int] = [:], next: [String] = [], notes: [Int: AskNote] = [:], pickedNext: Set<Int> = [], explainNext: Set<Int> = []) {
+    public init(seq: Int, asks: [Ask], ticked: Set<Int> = [], isOpen: Bool = true, picks: [Int: Int] = [:], next: [String] = [], notes: [Int: AskNote] = [:], pickedNext: Set<Int> = [], explainNext: Set<Int> = [], looseEnds: [LooseEnd]? = nil) {
         self.seq = seq
+        self.looseEnds = looseEnds
         self.notes = notes
         self.pickedNext = pickedNext
         self.explainNext = explainNext

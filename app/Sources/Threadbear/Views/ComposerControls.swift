@@ -975,7 +975,7 @@ private struct SendButton: View {
             SpinnerMark(color: .secondaryLabelColor)
                 .padding(zoomed(6))
                 .frame(width: Self.size, height: Self.size)
-                .background(Circle().fill(Color.primary.opacity(0.1)))
+                .background(ButtonShape(square: Glass.shared.monoStyle).fill(Color.primary.opacity(0.1)))
                 .tip("Stopping")
                 .accessibilityLabel("Stopping")
         } else if running && !canSend {

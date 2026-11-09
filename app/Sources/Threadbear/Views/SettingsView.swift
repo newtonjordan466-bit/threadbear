@@ -111,13 +111,14 @@ private struct GeneralSettings: View {
     /// The settings kept on this Mac (UserDefaults), not in the runner.
     @ViewBuilder private var thisMac: some View {
         SettingsSection("Appearance",
-                        about: "Light or dark for Threadbear only. Same as the Mac follows System Settings > Appearance.",
-                        ask: "change it for you.") {
+                        about: "Light or dark for Threadbear only. Same as the Mac follows System Settings > Appearance. Glass lets your desktop show through the window, frosted, in the style of MonoCode. See-through sets how much shows: the left end is MonoCode's own amount, the right end clearer. MonoCode style makes replies, titles and the sidebar a point or so smaller, and gives the message box flat grey pills and your messages grey bubbles, as MonoCode has them. All of these are this Mac's own and change straight away.",
+                        ask: "change the colours, the type or the glass further than these do.") {
             Picker("Appearance", selection: $appearance) {
                 ForEach(AppAppearance.allCases) { Text($0.title).tag($0) }
             }
             .tip("Light or dark for Threadbear, whatever the Mac is set to")
             .onChange(of: appearance) { _, new in new.apply() }
+            GlassRows()
         }
 
         SettingsSection("Notifications",
@@ -162,8 +163,6 @@ private struct GeneralSettings: View {
                         }
                     }
                 }
-
-                AppearanceSettings()
 
                 InstructionsSection()
 
@@ -231,25 +230,23 @@ private struct GeneralSettings: View {
 }
 
 /// This Mac's own look (Glass): the frosted window and MonoCode's style, kept in UserDefaults rather than the runner.
-private struct AppearanceSettings: View {
+/// Glass, its See-through slider and MonoCode style (Glass.swift): rows
+/// in the Appearance section, beside light or dark.
+private struct GlassRows: View {
     private let glass = Glass.shared
 
     var body: some View {
         @Bindable var glass = glass
-        SettingsSection("Appearance",
-                        about: "Glass lets your desktop show through the window, frosted, in the style of MonoCode. See-through sets how much shows: the left end is MonoCode's own amount, the right end clearer. MonoCode style makes replies, titles and the sidebar a point or so smaller, and gives the message box flat grey pills and your messages grey bubbles, as MonoCode has them. Both are this Mac's own and change straight away.",
-                        ask: "change the colours, the type or the glass further than these do.") {
-            Toggle("Glass", isOn: $glass.enabled)
-                .tip("Let the desktop show through the window, frosted")
-            LabeledContent("See-through") {
-                Slider(value: $glass.strength, in: 0...1)
-                    .frame(width: 180)
-                    .tip("How much of the desktop shows through")
-            }
-            .disabled(!glass.enabled)
-            Toggle("MonoCode style", isOn: $glass.monoStyle)
-                .tip("Smaller text, flat pills and grey bubbles, as MonoCode has them")
+        Toggle("Glass", isOn: $glass.enabled)
+            .tip("Let the desktop show through the window, frosted")
+        LabeledContent("See-through") {
+            Slider(value: $glass.strength, in: 0...1)
+                .frame(width: 180)
+                .tip("How much of the desktop shows through")
         }
+        .disabled(!glass.enabled)
+        Toggle("MonoCode style", isOn: $glass.monoStyle)
+            .tip("Smaller text, flat pills and grey bubbles, as MonoCode has them")
     }
 }
 

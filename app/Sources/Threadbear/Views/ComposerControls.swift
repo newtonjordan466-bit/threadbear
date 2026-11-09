@@ -751,7 +751,7 @@ private struct ComposerChip: View {
                 if !title.isEmpty {
                     Text(title)
                         .font(.system(size: TypeScale.chip))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(Glass.shared.monoStyle ? .primary : .secondary)
                         .lineLimit(1)
                 }
                 switch badge {
@@ -779,8 +779,10 @@ private struct ComposerChip: View {
             .padding(.horizontal, zoomed(7))
             .frame(height: zoomed(26))
             .background(
-                RoundedRectangle(cornerRadius: zoomed(7), style: .continuous)
-                    .fill(Color.primary.opacity(hovering ? 0.07 : 0))
+                // MonoCode's style: a flat grey pill at rest (10%, 15% on
+                // hover), with 6 pt corners. Threadbear's: bare until hovered.
+                RoundedRectangle(cornerRadius: zoomed(Glass.shared.monoStyle ? 6 : 7), style: .continuous)
+                    .fill(Color.primary.opacity(Glass.shared.monoStyle ? (hovering ? 0.15 : 0.10) : (hovering ? 0.07 : 0)))
             )
             .contentShape(Rectangle())
         }
@@ -799,9 +801,12 @@ private struct ComposerChip: View {
 
 private struct ChipDivider: View {
     var body: some View {
-        Rectangle()
-            .fill(Color.primary.opacity(0.12))
-            .frame(width: 1, height: zoomed(12))
+        // Pills stand apart on their own in MonoCode's style.
+        if !Glass.shared.monoStyle {
+            Rectangle()
+                .fill(Color.primary.opacity(0.12))
+                .frame(width: 1, height: zoomed(12))
+        }
     }
 }
 
@@ -819,8 +824,8 @@ private struct PlusButton: View {
                 .font(.system(size: zoomed(15), weight: .regular))
                 .foregroundStyle(.secondary)
                 .frame(width: zoomed(26), height: zoomed(26))
-                .background(Circle().fill(Color.primary.opacity(hovering ? 0.08 : 0)))
-                .contentShape(Circle())
+                .background(ButtonShape(square: Glass.shared.monoStyle).fill(Color.primary.opacity(Glass.shared.monoStyle ? (hovering ? 0.15 : 0.10) : (hovering ? 0.08 : 0))))
+                .contentShape(ButtonShape(square: Glass.shared.monoStyle))
         }
         .buttonStyle(.plain)
         .background(MenuAnchorView(anchor: anchor))
@@ -852,7 +857,7 @@ private struct SendButton: View {
             SpinnerMark(color: .secondaryLabelColor)
                 .padding(zoomed(6))
                 .frame(width: Self.size, height: Self.size)
-                .background(Circle().fill(Color.primary.opacity(0.1)))
+                .background(ButtonShape(square: Glass.shared.monoStyle).fill(Color.primary.opacity(0.1)))
                 .tip("Starting the thread")
                 .accessibilityLabel("Starting the thread")
         } else if running && !canSend {
@@ -883,9 +888,21 @@ private struct CircleButtonStyle: ButtonStyle {
         configuration.label
             .foregroundStyle(filled ? AnyShapeStyle(.background) : AnyShapeStyle(.tertiary))
             .frame(width: SendButton.size, height: SendButton.size)
-            .background(Circle().fill(filled ? Color.primary : Color.primary.opacity(0.1)))
+            .background(ButtonShape(square: Glass.shared.monoStyle).fill(filled ? Color.primary : Color.primary.opacity(0.1)))
             .opacity(configuration.isPressed ? 0.7 : 1)
-            .contentShape(Circle())
+            .contentShape(ButtonShape(square: Glass.shared.monoStyle))
+    }
+}
+
+/// The plus and send buttons' shape: Threadbear's circle, or MonoCode's
+/// square with 6 pt corners in its style (Glass.monoStyle).
+private struct ButtonShape: Shape {
+    let square: Bool
+
+    func path(in rect: CGRect) -> Path {
+        square
+            ? RoundedRectangle(cornerRadius: zoomed(6), style: .continuous).path(in: rect)
+            : Circle().path(in: rect)
     }
 }
 

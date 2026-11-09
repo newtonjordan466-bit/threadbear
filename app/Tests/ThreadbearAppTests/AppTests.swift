@@ -6,8 +6,19 @@ import XCTest
 /// ⌘= and ⌘-: every size comes from TypeScale, scaled by the zoom.
 @MainActor
 final class TextZoomTests: XCTestCase {
+    /// These check Threadbear's own design sizes, so MonoCode's (Glass) are
+    /// off while they run, and put back after.
+    private var monoCodeSizes = true
+
+    override func setUp() {
+        super.setUp()
+        monoCodeSizes = Glass.shared.monoStyle
+        Glass.shared.monoStyle = false
+    }
+
     override func tearDown() {
         TextZoom.shared.reset()
+        Glass.shared.monoStyle = monoCodeSizes
         super.tearDown()
     }
 

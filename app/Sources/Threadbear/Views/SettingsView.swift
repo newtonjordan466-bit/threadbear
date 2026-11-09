@@ -96,6 +96,8 @@ private struct GeneralSettings: View {
                     }
                 }
 
+                AppearanceSettings()
+
                 // One reply, Bullet replies, the two live-CLI steppers and
                 // Follow main left here on 2 Nov: Mike wants as few settings
                 // as possible, the defaults suit nearly everyone, and anyone
@@ -138,6 +140,29 @@ private struct GeneralSettings: View {
         panel.directoryURL = URL(fileURLWithPath: (current as NSString).expandingTildeInPath)
         if panel.runModal() == .OK, let url = panel.url {
             app.updateSettings(SettingsUpdate(defaultCwd: url.path))
+        }
+    }
+}
+
+/// This Mac's own look (Glass): the frosted window and MonoCode's style, kept in UserDefaults rather than the runner.
+private struct AppearanceSettings: View {
+    private let glass = Glass.shared
+
+    var body: some View {
+        @Bindable var glass = glass
+        SettingsSection("Appearance",
+                        about: "Glass lets your desktop show through the window, frosted, in the style of MonoCode. See-through sets how much shows: the left end is MonoCode's own amount, the right end clearer. MonoCode style makes replies, titles and the sidebar a point or so smaller, and gives the message box flat grey pills and your messages grey bubbles, as MonoCode has them. Both are this Mac's own and change straight away.",
+                        ask: "change the colours, the type or the glass further than these do.") {
+            Toggle("Glass", isOn: $glass.enabled)
+                .tip("Let the desktop show through the window, frosted")
+            LabeledContent("See-through") {
+                Slider(value: $glass.strength, in: 0...1)
+                    .frame(width: 180)
+                    .tip("How much of the desktop shows through")
+            }
+            .disabled(!glass.enabled)
+            Toggle("MonoCode style", isOn: $glass.monoStyle)
+                .tip("Smaller text, flat pills and grey bubbles, as MonoCode has them")
         }
     }
 }
